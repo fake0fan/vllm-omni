@@ -370,30 +370,50 @@ class StageRequestMetrics:
 
 
 class OrchestratorMetrics:
-    def __init__(
-        self,
-        num_stages: int,
-        enable_stats: bool,
-        wall_start_ts: float,
-    ) -> None:
+    """Centralized metrics collection for the orchestrator pipeline.
+    
+    Tracks per-request timing, per-stage statistics, and transfer metrics.
+    """
+
+    def __init__(self, num_stages: int, enable_stats: bool) -> None:
         self.num_stages = int(num_stages)
         self.enable_stats = bool(enable_stats)
-        self.stage_total_time_ms: list[float] = [0.0 for _ in range(self.num_stages)]
-        self.stage_total_tokens: list[int] = [0 for _ in range(self.num_stages)]
-        self.stage_req_counts: list[int] = [0 for _ in range(self.num_stages)]
+        
+        # Wall clock timing
+        self.wall_start_ts: float = time.time()
+        self.last_finish_ts: float = self.wall_start_ts
+        
+        # Per-request timing (moved from _run_generation)
+        self._req_start_ts: dict[str, float] = {}
+        
+        # Per-stage metrics
+        self.stage_total_time_ms: list[float] = [0.0] * num_stages
+        self.stage_total_tokens: list[int] = [0] * num_stages
+        self.stage_req_counts: list[int] = [0] * num_stages
+        self.stage_seen_batches: dict[int, set] = {sid: set() for sid in range(num_stages)}
+        self.stage_first_ts: list[float | None] = [None] * num_stages
+        self.stage_last_ts: list[float | None] = [None] * num_stages
+        
+        # Transfer metrics
         self.transfer_agg: dict[tuple[int, int], dict[str, float]] = {}
         self.transfer_edge_req: dict[tuple[int, int, str], dict[str, float]] = {}
+        
+        # End-to-end metrics
         self.e2e_total_ms: float = 0.0
         self.e2e_total_tokens: int = 0
         self.e2e_count: int = 0
         self.e2e_done: set[str] = set()
+        
+        # Per-request aggregation
         self.per_request: dict[str, dict[str, Any]] = {}
         self.sum_per_request_transfer_ms: float = 0.0
-        self.wall_start_ts: float = float(wall_start_ts)
-        self.last_finish_ts: float = float(wall_start_ts)
-        self.stage_seen_batches: dict[int, set] = {sid: set() for sid in range(self.num_stages)}
-        self.stage_first_ts: list[float | None] = [None for _ in range(self.num_stages)]
-        self.stage_last_ts: list[float | None] = [None for _ in range(self.num_stages)]
+
+    def on_request_submit(self, req_id: str) -> None:
+        """Record when a request is submitted to the pipeline."""
+        self._req_start_ts[req_id] = time.time()
+        # Mark first input time for stage-0
+        if self.stage_first_ts[0] is None:
+            self.stage_first_ts[0] = self._req_start_ts[req_id]
 
     def on_stage_metrics(self, stage_id: int, req_id: Any, metrics: dict[str, Any]) -> None:
         record_stage_metrics(
@@ -506,14 +526,10 @@ class OrchestratorMetrics:
             float(tx_ms),
         )
 
-    def on_finalize_request(
-        self,
-        stage_id: int,
-        req_id: Any,
-        req_start_ts: float,
-    ) -> None:
+    def on_finalize_request(self, stage_id: int, req_id: Any) -> None:
+        """Handle request completion and calculate E2E metrics."""
         rid_key = str(req_id)
-        _t0 = float(req_start_ts)
+        _t0 = self._req_start_ts.get(rid_key, self.wall_start_ts)
         _t1 = time.time()
         # Update last output time for this stage
         prev_last = self.stage_last_ts[stage_id]

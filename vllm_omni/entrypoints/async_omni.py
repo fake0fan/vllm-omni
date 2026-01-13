@@ -305,10 +305,6 @@ class AsyncOmni(OmniBase):
 
             # Orchestrator keeps stage objects for input derivation
             num_stages = len(self.stage_list)
-            # Track per-request start time for end-to-end timing
-            _req_start_ts: dict[int, float] = {}
-            _wall_start_ts: float = time.time()
-            # _last_finish_ts: float = _wall_start_ts
 
             # Determine the final stage for E2E stats (highest stage_id with
             # final_output=True; fallback to last stage)
@@ -316,19 +312,14 @@ class AsyncOmni(OmniBase):
                 output_modalities, self.output_modalities, self.stage_list
             )
 
-            # Metrics/aggregation helper
-            metrics = OrchestratorMetrics(
-                num_stages,
-                self._enable_stats,
-                _wall_start_ts,
-            )
+            # Metrics/aggregation helper (manages request timing internally)
+            metrics = OrchestratorMetrics(num_stages, self._enable_stats)
+
             # Seed stage-0 queue with all requests
             logger.debug(f"[{self._name}] Seeding request into stage-0")
             req_state = ClientRequestState(request_id)
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
-            # Mark first input time for stage-0
-            metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
             sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
             task = {
@@ -337,7 +328,7 @@ class AsyncOmni(OmniBase):
                 "sampling_params": sp0,
             }
             self.stage_list[0].submit(task)
-            _req_start_ts[request_id] = time.time()
+            metrics.on_request_submit(request_id)
             logger.debug(f"[{self._name}] Enqueued request {request_id} to stage-0")
 
             logger.debug(f"[{self._name}] Entering scheduling loop: stages={num_stages}")

@@ -436,6 +436,74 @@ class OmniBase:
                         e,
                     )
 
+    def _update_metrics(
+        self,
+        metrics: OrchestratorMetrics,
+        result: dict[str, Any],
+        stage_id: int,
+        request_id: str,
+        pbar: Any,
+    ) -> None:
+        """Update metrics from stage result and refresh progress bar."""
+        try:
+            stage_metrics = result.get("metrics")
+            if stage_metrics is None:
+                return
+            if not isinstance(stage_metrics, dict):
+                stage_metrics = asdict(stage_metrics)
+            metrics.on_stage_metrics(stage_id, request_id, stage_metrics)
+
+            if pbar:
+                elapsed = pbar.format_dict["elapsed"] or 1e-6
+                total_out = sum(metrics.stage_total_tokens)
+                speed = total_out / elapsed
+                unit = "img" if self.output_modalities[stage_id] == "image" else "tok"
+                avg_latency = metrics.e2e_total_ms / metrics.e2e_count if metrics.e2e_count > 0 else 0
+                pbar.postfix = f"stage-{stage_id} {speed:.1f} {unit}/s, avg latency: {avg_latency:.1f}ms"
+        except Exception as e:
+            logger.exception(f"[{self._name}] Metrics error for {request_id} at stage-{stage_id}: {e}")
+
+    def _forward_to_next_stage(
+        self,
+        request_id: str,
+        current_stage_id: int,
+        next_stage_id: int,
+        sampling_params_list: list[Any],
+        request_id_to_prompt: dict[str, Any],
+        metrics: OrchestratorMetrics,
+    ) -> None:
+        """Forward request output to the next stage via connector."""
+        next_stage = self.stage_list[next_stage_id]
+        try:
+            next_inputs = next_stage.process_engine_inputs(
+                self.stage_list, [request_id_to_prompt[request_id]]
+            )
+        except Exception as e:
+            logger.exception(f"[{self._name}] Failed to process inputs for stage-{next_stage_id}: {e}")
+            raise
+
+        connector_key = (str(current_stage_id), str(next_stage_id))
+        connector = self.connectors.get(connector_key)
+        if not connector:
+            raise RuntimeError(
+                f"No connector configured for edge {current_stage_id} -> {next_stage_id}"
+            )
+
+        success = try_send_via_connector(
+            connector=connector,
+            stage_id=current_stage_id,
+            next_stage_id=next_stage_id,
+            req_id=request_id,
+            next_inputs=next_inputs,
+            sampling_params=sampling_params_list[next_stage_id],
+            original_prompt=request_id_to_prompt[request_id],
+            next_stage_queue_submit_fn=next_stage.submit,
+            metrics=metrics,
+        )
+        if not success:
+            raise RuntimeError(f"Failed to send {request_id} to stage-{next_stage_id}")
+        logger.debug(f"[{self._name}] Forwarded {request_id} to stage-{next_stage_id}")
+
     def close(self) -> None:
         """Close all stage processes and clean up resources."""
         if hasattr(self, "_weak_finalizer"):
@@ -621,23 +689,17 @@ class Omni(OmniBase):
     ) -> Generator[OmniRequestOutput, None, None]:
         """Run generation through all stages in the pipeline."""
         logger.debug(f"[{self._name}] generate() called")
-        if sampling_params_list is None:
-            raise ValueError("sampling_params_list is required for pipelined generation")
+        assert sampling_params_list is not None, "sampling_params_list is required for pipelined generation"
 
         # Normalize sampling_params_list to a list
         if not isinstance(sampling_params_list, (list, tuple)):
             sampling_params_list = [sampling_params_list]
-        else:
-            sampling_params_list = list(sampling_params_list)
 
-        if len(sampling_params_list) != len(self.stage_list):
-            raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
+        assert len(sampling_params_list) == len(self.stage_list), \
+            f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}"
 
         # Normalize prompts to a list for per-request iteration
-        if not isinstance(prompts, (list, tuple)):
-            request_prompts: list[PromptType] = [prompts]
-        else:
-            request_prompts = list(prompts)
+        request_prompts = [prompts] if not isinstance(prompts, (list, tuple)) else prompts
 
         # Orchestrator keeps stage objects for input derivation
         num_stages = len(self.stage_list)
@@ -645,10 +707,6 @@ class Omni(OmniBase):
         # Generate globally unique request IDs and map them to original prompts
         request_ids: list[str] = [f"{i}_{uuid.uuid4()}" for i in range(len(request_prompts))]
         request_id_to_prompt: dict[str, PromptType] = {rid: p for rid, p in zip(request_ids, request_prompts)}
-
-        # Track per-request start time for end-to-end timing
-        _req_start_ts: dict[str, float] = {}
-        _wall_start_ts: float = time.time()
 
         # Determine the final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
         final_stage_id_to_prompt: dict[str, int] = {}
@@ -662,33 +720,20 @@ class Omni(OmniBase):
             )
             final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
 
-        # Metrics/aggregation helper
-        metrics = OrchestratorMetrics(
-            num_stages,
-            self._enable_stats,
-            _wall_start_ts,
-        )
+        # Metrics/aggregation helper (manages request timing internally)
+        metrics = OrchestratorMetrics(num_stages, self._enable_stats)
 
-        it = request_id_to_prompt.items()
-        if use_tqdm:
-            tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
-            it = tqdm_func(it, desc="Adding requests")
-
-        # Seed stage-0 queue with all requests
-        logger.debug(f"[{self._name}] Seeding {len(request_prompts)} requests into stage-0")
-        # Mark first input time for stage-0
-        metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
-
-        for req_id, prompt in request_id_to_prompt.items():
-            sp0 = sampling_params_list[0]  # type: ignore[index]
-            task = {
-                "request_id": req_id,
+        # Submit all requests to stage-0
+        logger.debug(f"[{self._name}] Submitting {len(request_prompts)} requests to stage-0")
+        stage0_params = sampling_params_list[0]
+        for request_id, prompt in request_id_to_prompt.items():
+            self.stage_list[0].submit({
+                "request_id": request_id,
                 "engine_inputs": prompt,
-                "sampling_params": sp0,
-            }
-            self.stage_list[0].submit(task)
-            _req_start_ts[req_id] = time.time()
-            logger.debug(f"[{self._name}] Enqueued request {req_id} to stage-0")
+                "sampling_params": stage0_params,
+            })
+            metrics.on_request_submit(request_id)
+            logger.debug(f"[{self._name}] Submitted request {request_id} to stage-0")
 
         pbar = None
         if use_tqdm:
@@ -699,150 +744,69 @@ class Omni(OmniBase):
                 dynamic_ncols=True,
                 postfix=(f"est. speed input: {0:.2f} unit/s, output: {0:.2f} unit/s"),
             )
-        # For each stage, forward results to next stage; collect finals at the end
-        # We pipeline by continually polling output queues in stage order
-        remaining_by_stage: list[int] = [len(request_prompts)] + [0] * (num_stages - 1)
-        completed_requests = 0
-        total_requests = len(request_prompts)
+        # Pipeline scheduling loop: poll stages, forward results, collect finals
+        completed = 0
+        total = len(request_prompts)
+        logger.debug(f"[{self._name}] Starting pipeline: {total} requests, {num_stages} stages")
 
-        logger.debug(
-            f"[{self._name}] Entering scheduling loop: total_requests={total_requests}, stages={num_stages}",
-        )
-        while completed_requests < total_requests:
+        while completed < total:
             made_progress = False
+
             for stage_id, stage in enumerate(self.stage_list):
                 result = stage.try_collect()
                 if result is None:
                     continue
 
                 made_progress = True
-                req_id = result.get("request_id")
+                request_id = result.get("request_id")
+
+                # Handle errors
                 if "error" in result:
-                    logger.error(
-                        f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
-                    )
+                    logger.error(f"[{self._name}] Stage-{stage_id} error: {result['error']}")
                     continue
 
+                # Handle stage initialization signal
                 if result.get("type") == "stage_ready":
-                    # Only happens when stage is initialized slower than expected,
-                    # so we wait for a short time and try again
                     time.sleep(0.05)
                     continue
 
+                # Process stage output
                 engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
-                # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
-                try:
-                    _m = result.get("metrics")
-                    if _m is not None:
-                        if not isinstance(_m, dict):
-                            _m = asdict(_m)
-                        metrics.on_stage_metrics(stage_id, req_id, _m)
-                        if pbar:
-                            elapsed = pbar.format_dict["elapsed"] or 1e-6
-                            # Aggregate total tokens/images across all stages
-                            total_out = sum(metrics.stage_total_tokens)
-                            out_spd = total_out / elapsed
-
-                            modality = self.output_modalities[stage_id]
-                            unit = "img" if modality == "image" else "tok"
-
-                            # Pre-calculate for cleaner string formatting
-                            if metrics.e2e_count > 0:
-                                avg_lat = metrics.e2e_total_ms / metrics.e2e_count
-                            else:
-                                avg_lat = 0
-
-                            # Align with vLLM's wording "est. speed" using multi-line parentheses
-                            pbar.postfix = (
-                                f"est. speed stage-{stage_id} {unit}/s: {out_spd:.2f}, avg e2e_lat: {avg_lat:.1f}ms"
-                            )
-                except Exception as e:
-                    logger.exception(
-                        f"[{self._name}] Failed to process metrics for stage {stage_id}, req {req_id}: {e}",
-                    )
-                logger.debug(
-                    f"[{self._name}] Stage-{stage_id} completed request {req_id}; forwarding or finalizing",
-                )
                 stage.set_engine_outputs(engine_outputs)
 
-                if getattr(stage, "final_output", False):
-                    logger.debug(
-                        f"[{self._name}] Request {req_id} finalized at stage-{stage_id}",
-                    )
+                # Update metrics
+                self._update_metrics(metrics, result, stage_id, request_id, pbar)
 
-                    # End-to-end timing and time-per-token for final output
-                    # (only once per request at the designated final stage)
-                    try:
-                        rid_key = str(req_id)
-                        if stage_id == final_stage_id_to_prompt[req_id] and rid_key not in metrics.e2e_done:
-                            metrics.on_finalize_request(
-                                stage_id,
-                                req_id,
-                                _req_start_ts.get(req_id, _wall_start_ts),
-                            )
-                    except Exception as e:
-                        logger.exception(
-                            f"[{self._name}] Finalize request handling error for req {req_id} at stage {stage_id}: {e}",
-                        )
+                # Yield final output if this is a final stage
+                final_stage_for_request = final_stage_id_to_prompt[request_id]
+                if getattr(stage, "final_output", False):
+                    if stage_id == final_stage_for_request and str(request_id) not in metrics.e2e_done:
+                        metrics.on_finalize_request(stage_id, request_id)
                     yield OmniRequestOutput(
                         stage_id=stage_id,
-                        final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
+                        final_output_type=stage.final_output_type,
                         request_output=engine_outputs,
                     )
 
+                # Forward to next stage or mark completed
                 next_stage_id = stage_id + 1
-                if next_stage_id <= final_stage_id_to_prompt[req_id]:
-                    next_stage: OmniStage = self.stage_list[next_stage_id]
-                    try:
-                        next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
-                    except Exception as e:
-                        logger.exception(
-                            f"[{self._name}] Process engine inputs error for req {req_id}"
-                            f" at stage {next_stage_id}: {e}",
-                        )
-                        continue
-                    sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
-
-                    # Check if we have a connector for this edge
-                    connector_key = (str(stage_id), str(next_stage_id))
-                    connector = self.connectors.get(connector_key)
-                    sent_via_connector = False
-                    if connector:
-                        sent_via_connector = try_send_via_connector(
-                            connector=connector,
-                            stage_id=stage_id,
-                            next_stage_id=next_stage_id,
-                            req_id=req_id,
-                            next_inputs=next_inputs,
-                            sampling_params=sp_next,
-                            original_prompt=request_id_to_prompt[req_id],
-                            next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
-                            metrics=metrics,
-                        )
-
-                    if not sent_via_connector:
-                        raise RuntimeError(
-                            f"[{self._name}] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
-                            "Configure a connector for this edge or inspect connector logs for details."
-                        )
-                    logger.debug(
-                        f"[{self._name}] Forwarded request {req_id} to stage-{next_stage_id}",
+                if next_stage_id <= final_stage_for_request:
+                    self._forward_to_next_stage(
+                        request_id, stage_id, next_stage_id,
+                        sampling_params_list, request_id_to_prompt, metrics
                     )
-                    remaining_by_stage[next_stage_id] += 1
                 else:
-                    completed_requests += 1
+                    completed += 1
                     if pbar:
-                        final_mod = self.output_modalities[final_stage_id_to_prompt[req_id]]
-                        pbar.unit = "img" if final_mod == "image" else "req"
+                        pbar.unit = "img" if self.output_modalities[final_stage_for_request] == "image" else "req"
                         pbar.update(1)
-                    logger.debug(
-                        f"[{self._name}] Request {req_id} fully completed ({completed_requests}/{total_requests})",
-                    )
+                    logger.debug(f"[{self._name}] Completed {request_id} ({completed}/{total})")
 
             if not made_progress:
                 time.sleep(0.005)
-        logger.debug(f"[{self._name}] All requests completed")
+
+        logger.debug(f"[{self._name}] All {total} requests completed")
 
         if pbar:
             pbar.close()
