@@ -17,6 +17,7 @@ from tqdm.auto import tqdm
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors import (
     get_stage_connector_config,
@@ -252,19 +253,33 @@ class OmniBase:
 
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
-        # We temporally create a default config for diffusion stage.
-        # In the future, we should merge the default config with the user-provided config.
-        # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
-        if "dtype" in kwargs:
-            kwargs["dtype"] = str(kwargs["dtype"])
         cache_backend = kwargs.get("cache_backend", "none")
         cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
-        # TODO: hack, calculate devices based on parallel config.
+
         devices = "0"
         if "parallel_config" in kwargs:
+            parallel_config = kwargs["parallel_config"]
             num_devices = kwargs["parallel_config"].world_size
             for i in range(1, num_devices):
                 devices += f",{i}"
+        else:
+            ulysses_degree = kwargs.get("ulysses_degree") or 1
+            ring_degree = kwargs.get("ring_degree") or 1
+            sequence_parallel_size = kwargs.get("sequence_parallel_size")
+            if sequence_parallel_size is None:
+                sequence_parallel_size = ulysses_degree * ring_degree
+            num_devices = sequence_parallel_size
+            for i in range(1, num_devices):
+                devices += f",{i}"
+            parallel_config = DiffusionParallelConfig(
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                tensor_parallel_size=1,
+                sequence_parallel_size=sequence_parallel_size,
+                ulysses_degree=ulysses_degree,
+                ring_degree=ring_degree,
+                cfg_parallel_size=1,
+            )
         default_stage_cfg = [
             {
                 "stage_id": 0,
@@ -274,13 +289,14 @@ class OmniBase:
                     "devices": devices,
                     "max_batch_size": 1,
                 },
-                "engine_args": OmegaConf.create(
-                    {
-                        **kwargs,
-                        "cache_backend": cache_backend,
-                        "cache_config": cache_config,
-                    }
-                ),
+                "engine_args": {
+                    "parallel_config": parallel_config,
+                    "vae_use_slicing": kwargs.get("vae_use_slicing", False),
+                    "vae_use_tiling": kwargs.get("vae_use_tiling", False),
+                    "cache_backend": cache_backend,
+                    "cache_config": cache_config,
+                    "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
+                },
                 "final_output": True,
                 "final_output_type": "image",
             }
@@ -689,14 +705,17 @@ class Omni(OmniBase):
     ) -> Generator[OmniRequestOutput, None, None]:
         """Run generation through all stages in the pipeline."""
         logger.debug(f"[{self._name}] generate() called")
-        assert sampling_params_list is not None, "sampling_params_list is required for pipelined generation"
+        if sampling_params_list is None:
+            raise ValueError("sampling_params_list is required for pipelined generation")
 
         # Normalize sampling_params_list to a list
         if not isinstance(sampling_params_list, (list, tuple)):
             sampling_params_list = [sampling_params_list]
 
-        assert len(sampling_params_list) == len(self.stage_list), \
-            f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}"
+        if len(sampling_params_list) != len(self.stage_list):
+            raise ValueError(
+                f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}"
+            )
 
         # Normalize prompts to a list for per-request iteration
         request_prompts = [prompts] if not isinstance(prompts, (list, tuple)) else prompts

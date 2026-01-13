@@ -19,7 +19,6 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 # Internal imports (our code)
 from vllm_omni.config import OmniModelConfig
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
 from vllm_omni.distributed.ray_utils.utils import try_close_ray
 from vllm_omni.engine.input_processor import OmniInputProcessor
@@ -114,60 +113,6 @@ class AsyncOmni(OmniBase):
             self._ray_pg,
             self.output_handler,
         )
-
-    def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Create default diffusion stage configuration."""
-        # TODO: here is different from the Omni class. We should merge the two in the future.
-        cache_backend = kwargs.get("cache_backend", "none")
-        cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
-
-        devices = "0"
-        if "parallel_config" in kwargs:
-            parallel_config = kwargs["parallel_config"]
-            num_devices = kwargs["parallel_config"].world_size
-            for i in range(1, num_devices):
-                devices += f",{i}"
-        else:
-            ulysses_degree = kwargs.get("ulysses_degree") or 1
-            ring_degree = kwargs.get("ring_degree") or 1
-            sequence_parallel_size = kwargs.get("sequence_parallel_size")
-            if sequence_parallel_size is None:
-                sequence_parallel_size = ulysses_degree * ring_degree
-            num_devices = sequence_parallel_size
-            for i in range(1, num_devices):
-                devices += f",{i}"
-            parallel_config = DiffusionParallelConfig(
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
-                tensor_parallel_size=1,
-                sequence_parallel_size=sequence_parallel_size,
-                ulysses_degree=ulysses_degree,
-                ring_degree=ring_degree,
-                cfg_parallel_size=1,
-            )
-        default_stage_cfg = [
-            {
-                "stage_id": 0,
-                "stage_type": "diffusion",
-                "runtime": {
-                    "process": True,
-                    "devices": devices,
-                    "max_batch_size": 1,
-                },
-                "engine_args": {
-                    "parallel_config": parallel_config,
-                    "vae_use_slicing": kwargs.get("vae_use_slicing", False),
-                    "vae_use_tiling": kwargs.get("vae_use_tiling", False),
-                    "cache_backend": cache_backend,
-                    "cache_config": cache_config,
-                    "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
-                },
-                "final_output": True,
-                "final_output_type": "image",
-            }
-        ]
-        default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
-        return default_stage_cfg
 
     def _process_stage_ready(self, stage: OmniStage, stage_id: int, result: dict[str, Any]) -> None:
         # Store vllm_config received from worker process (may be None for diffusion stages)
