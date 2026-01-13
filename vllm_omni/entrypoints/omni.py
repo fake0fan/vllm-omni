@@ -78,34 +78,66 @@ class OmniBase:
     """Base class for serving Omni models.
 
     Args:
-        *args: Variable length argument list.
-            - args[0]: Model name or path to load.
-        **kwargs: Arbitrary keyword arguments.
-            - model: Model name or path to load (if not in args).
-            - stage_configs_path: Optional path to YAML file containing stage
-              configurations. If None, configurations are loaded from the model.
-            - log_stats: Whether to enable statistics logging
-              be written to files with stage-specific suffixes.
-            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
-              when the previous stage finished (possibly a prior Omni run with GPU
-              reuse/overlap) to when the current stage starts to initialize.
-            - shm_threshold_bytes: Threshold in bytes for using shared memory
-              for IPC. Objects larger than this threshold will use shared memory.
-            - worker_backend: Backend for worker processes. Default is "multi_process".
-            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
-            - batch_timeout: Timeout in seconds for batching requests within a stage
-            - init_timeout: Timeout in seconds for waiting for all stages to initialize
-            - Additional keyword arguments passed to stage engines.
+        model: Model name or path to load.
+
+        Stage Management:
+            stage_configs_path: Optional path to YAML file containing stage
+                configurations. If None, configurations are loaded from the model.
+            log_stats: Whether to enable statistics logging.
+            stage_init_timeout: Per-stage init watchdog (seconds).
+            init_timeout: Timeout in seconds for waiting for all stages to initialize.
+            batch_timeout: Timeout in seconds for batching requests within a stage.
+
+        Distributed/IPC:
+            worker_backend: Backend for worker processes. Default is "multi_process".
+            ray_address: Address of Ray cluster for Ray backend.
+            shm_threshold_bytes: Threshold in bytes for using shared memory for IPC.
+
+        LLM:
+            tokenizer: Optional tokenizer name or path. If None, uses model's tokenizer.
+
+        Diffusion:
+            vae_use_slicing: Enable VAE slicing for memory optimization.
+            vae_use_tiling: Enable VAE tiling for memory optimization.
+            cache_backend: Cache backend type ("none", "cache_dit", "tea_cache").
+            cache_config: Cache configuration dictionary.
+            parallel_config: Diffusion parallel configuration.
+            enforce_eager: Force eager execution mode.
+            boundary_ratio: MoE boundary ratio for Wan2.2.
+            flow_shift: Scheduler flow_shift for Wan2.2.
+
+        **kwargs: Additional keyword arguments passed to stage engines.
     """
 
-    def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
-        model = args[0] if args else kwargs.get("model", "")
-        assert model != "", "Null model id detected, please specify a model id."
+    def __init__(
+        self,
+        model: str,
+        *,
+        # === Stage Management ===
+        stage_configs_path: str | None = None,
+        log_stats: bool = False,
+        stage_init_timeout: int = 20,
+        init_timeout: int = 300,
+        batch_timeout: int = 10,
+        # === Distributed/IPC ===
+        worker_backend: str = "multi_process",
+        ray_address: str | None = None,
+        shm_threshold_bytes: int = 65536,
+        # === LLM ===
+        tokenizer: str | None = None,
+        # === Diffusion ===
+        vae_use_slicing: bool = False,
+        vae_use_tiling: bool = False,
+        cache_backend: str | None = None,
+        cache_config: dict[str, Any] | None = None,
+        parallel_config: Any | None = None,
+        enforce_eager: bool = False,
+        boundary_ratio: float | None = None,
+        flow_shift: float | None = None,
+        # === Additional ===
+        **kwargs: dict[str, Any]
+    ) -> None:
         model = omni_snapshot_download(model)
-        if args:
-            args[0] = model
-        elif kwargs.get("model", "") != "":
-            kwargs["model"] = model
 
         # Stage management attributes
         self.stage_list: list[OmniStage] = []
@@ -120,7 +152,73 @@ class OmniBase:
         # Stage workers will automatically create OmniLLM or OmniDiffusion instances
         # based on stage_type in YAML config (handled in omni_stage.py)
         logger.info(f"Initializing stages for model: {model}")
-        self._initialize_stages(model, kwargs)
+
+        # Merge explicit diffusion params into kwargs for stage configuration
+        diffusion_params = {
+            "vae_use_slicing": vae_use_slicing,
+            "vae_use_tiling": vae_use_tiling,
+            "cache_backend": cache_backend,
+            "cache_config": cache_config,
+            "parallel_config": parallel_config,
+            "enforce_eager": enforce_eager,
+            "boundary_ratio": boundary_ratio,
+            "flow_shift": flow_shift,
+        }
+        # Only include non-None values to allow kwargs to override defaults
+        diffusion_kwargs = {k: v for k, v in diffusion_params.items() if v is not None}
+        engine_kwargs = {**diffusion_kwargs, **kwargs}
+
+        # Base engine args for LLM stages
+        base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
+
+        # Load stage configurations from YAML
+        if stage_configs_path is None:
+            self.config_path = resolve_model_config_path(model)
+            self.stage_configs = load_stage_configs_from_model(model, base_engine_args=base_engine_args)
+            if not self.stage_configs:
+                default_stage_cfg = self._create_default_diffusion_stage_cfg(engine_kwargs)
+                self.stage_configs = OmegaConf.create(default_stage_cfg)
+        else:
+            self.config_path = stage_configs_path
+            self.stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
+
+        # Initialize connectors
+        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
+            self.config_path, worker_backend=worker_backend, shm_threshold_bytes=shm_threshold_bytes
+        )
+
+        # Initialize stats paths
+        self._enable_stats: bool = bool(log_stats)
+        self.worker_backend = worker_backend
+        self.ray_address = ray_address
+        self.batch_timeout = batch_timeout
+
+        # Build OmniStage instances in parallel, preserve original order
+        def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
+            idx, cfg = idx_cfg
+            return idx, OmniStage(cfg, stage_init_timeout=stage_init_timeout)
+
+        with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
+            futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
+            results: list[tuple[int, OmniStage]] = []
+            for fut in as_completed(futures):
+                results.append(fut.result())
+        results.sort(key=lambda x: x[0])
+        self.stage_list = [st for _, st in results]
+        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
+        self.output_modalities = [st.final_output_type for st in self.stage_list]
+        logger.debug(f"[{self._name}] Loaded {len(self.stage_list)} stages")
+
+        if self.worker_backend == "ray":
+            self._queue_cls = get_ray_queue_class()
+        else:
+            self._ctx = mp.get_context("spawn")
+            self._queue_cls = lambda: self._ctx.Queue(maxsize=0)
+
+        self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
+        self._start_stages(model)
+        # Wait for all stages to report readiness before seeding
+        self._wait_for_stages_ready(timeout=init_timeout)
 
     def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
         if cache_backend == "cache_dit":
@@ -189,73 +287,6 @@ class OmniBase:
         ]
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
         return default_stage_cfg
-
-    def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
-        """Initialize stage list management."""
-        stage_init_timeout = kwargs.get("stage_init_timeout", 20)
-        shm_threshold_bytes = kwargs.get("shm_threshold_bytes", 65536)
-        init_timeout = kwargs.get("init_timeout", 300)
-        worker_backend = kwargs.get("worker_backend", "multi_process")
-        ray_address = kwargs.get("ray_address", None)
-        batch_timeout = kwargs.get("batch_timeout", 10)
-        stage_configs_path = kwargs.get("stage_configs_path", None)
-        log_stats = kwargs.get("log_stats", False)
-
-        ### base engine args
-        tokenizer = kwargs.get("tokenizer", None)
-
-        base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
-
-        # Load stage configurations from YAML
-        if stage_configs_path is None:
-            self.config_path = resolve_model_config_path(model)
-            self.stage_configs = load_stage_configs_from_model(model, base_engine_args=base_engine_args)
-            if not self.stage_configs:
-                default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
-                self.stage_configs = OmegaConf.create(default_stage_cfg)
-        else:
-            self.config_path = stage_configs_path
-            self.stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
-
-        # Initialize connectors
-        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
-            self.config_path, worker_backend=worker_backend, shm_threshold_bytes=shm_threshold_bytes
-        )
-
-        # Initialize stats paths
-        self._enable_stats: bool = bool(log_stats)
-
-        self.worker_backend = worker_backend
-        self.ray_address = ray_address
-        self.batch_timeout = batch_timeout
-
-        # Build OmniStage instances in parallel, preserve original order
-        def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
-            idx, cfg = idx_cfg
-            return idx, OmniStage(cfg, stage_init_timeout=stage_init_timeout)
-
-        with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
-            futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
-            results: list[tuple[int, OmniStage]] = []
-            for fut in as_completed(futures):
-                results.append(fut.result())
-        results.sort(key=lambda x: x[0])
-        self.stage_list = [st for _, st in results]
-        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
-        self.output_modalities = [st.final_output_type for st in self.stage_list]
-        logger.debug(f"[{self._name}] Loaded {len(self.stage_list)} stages")
-
-        if self.worker_backend == "ray":
-            self._queue_cls = get_ray_queue_class()
-        else:
-            self._ctx = mp.get_context("spawn")
-            self._queue_cls = lambda: self._ctx.Queue(maxsize=0)
-
-        self._stage_init_timeout = max(0, int(stage_init_timeout))
-        self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
-        self._start_stages(model)
-        # Wait for all stages to report readiness before seeding
-        self._wait_for_stages_ready(timeout=init_timeout)
 
     def _start_stages(self, model: str) -> None:
         """Start all stage processes."""
@@ -422,34 +453,71 @@ class OmniBase:
 class Omni(OmniBase):
     """Unified entrypoint for both LLM and Diffusion models for better usability.
 
-    Args:
-        *args: Variable length argument list.
-            - args[0]: Model name or path to load.
-        **kwargs: Arbitrary keyword arguments.
-            - model: Model name or path to load (if not in args).
-            - stage_configs_path: Optional path to YAML file containing stage
-              configurations. If None, configurations are loaded from the model.
-            - log_stats: Whether to enable statistics logging
-              be written to files with stage-specific suffixes.
-            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
-              when the previous stage finished (possibly a prior Omni run with GPU
-              reuse/overlap) to when the current stage starts to initialize.
-            - shm_threshold_bytes: Threshold in bytes for using shared memory
-              for IPC. Objects larger than this threshold will use shared memory.
-            - worker_backend: Backend for worker processes. Default is "multi_process".
-            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
-            - batch_timeout: Timeout in seconds for batching requests within a stage
-            - init_timeout: Timeout in seconds for waiting for all stages to initialize
-            - Additional keyword arguments passed to stage engines.
+    See OmniBase for full parameter documentation.
 
     Example:
+        >>> # LLM model
         >>> omni = Omni(model="Qwen/Qwen2.5-Omni-7B")
-        >>> outputs = omni.generate(prompts="Hello, world!", sampling_params_list=[SamplingParams()])
-        >>> print(outputs)
+        >>> outputs = omni.generate(prompts="Hello, world!")
+
+        >>> # Diffusion model with cache acceleration
+        >>> omni = Omni(
+        ...     model="Qwen/Qwen-Image",
+        ...     cache_backend="cache_dit",
+        ...     vae_use_slicing=True,
+        ... )
+        >>> outputs = omni.generate(prompts="a cat sitting on a couch")
     """
 
-    def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        model: str,
+        *,
+        # === Stage Management ===
+        stage_configs_path: str | None = None,
+        log_stats: bool = False,
+        stage_init_timeout: int = 20,
+        init_timeout: int = 300,
+        batch_timeout: int = 10,
+        # === Distributed/IPC ===
+        worker_backend: str = "multi_process",
+        ray_address: str | None = None,
+        shm_threshold_bytes: int = 65536,
+        # === LLM ===
+        tokenizer: str | None = None,
+        # === Diffusion ===
+        vae_use_slicing: bool = False,
+        vae_use_tiling: bool = False,
+        cache_backend: str | None = None,
+        cache_config: dict[str, Any] | None = None,
+        parallel_config: Any | None = None,
+        enforce_eager: bool = False,
+        boundary_ratio: float | None = None,
+        flow_shift: float | None = None,
+        # === Additional ===
+        **kwargs: dict[str, Any]
+    ) -> None:
+        super().__init__(
+            model=model,
+            stage_configs_path=stage_configs_path,
+            log_stats=log_stats,
+            stage_init_timeout=stage_init_timeout,
+            init_timeout=init_timeout,
+            batch_timeout=batch_timeout,
+            worker_backend=worker_backend,
+            ray_address=ray_address,
+            shm_threshold_bytes=shm_threshold_bytes,
+            tokenizer=tokenizer,
+            vae_use_slicing=vae_use_slicing,
+            vae_use_tiling=vae_use_tiling,
+            cache_backend=cache_backend,
+            cache_config=cache_config,
+            parallel_config=parallel_config,
+            enforce_eager=enforce_eager,
+            boundary_ratio=boundary_ratio,
+            flow_shift=flow_shift,
+            **kwargs
+        )
 
         # Register weak reference cleanup (called on garbage collection)
         self._weak_finalizer = weakref.finalize(
@@ -461,7 +529,12 @@ class Omni(OmniBase):
         )
 
     def generate(
-        self, *args: Any, **kwargs: dict[str, Any]
+        self,
+        prompts: str | list[str] | None = None,
+        sampling_params_list: list[Any] | None = None,
+        *,
+        py_generator: bool = False,
+        **kwargs: dict[str, Any]
     ) -> Generator[OmniRequestOutput, None, None] | list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
 
@@ -469,28 +542,26 @@ class Omni(OmniBase):
         Each stage will use OmniLLM or OmniDiffusion based on stage_type.
 
         Args:
-            *args: Variable length argument list.
-                - args[0]: Input prompts for generation.
-                - args[1]: Optional list of per-stage parameters.
-            **kwargs: Arbitrary keyword arguments.
-                - prompt: Input prompts for generation (if not in args).
-                - sampling_params_list: Optional list of per-stage parameters (if not in args).
+            prompts: Input prompts for generation. Can be a single string or list of strings.
+            sampling_params_list: Optional list of per-stage parameters. If None, default
+                parameters will be used for all stages.
+            py_generator: Whether to return a Python generator for streaming results.
+            **kwargs: Additional keyword arguments passed to stage engines. Also supports
+                'prompt' as an alternative to 'prompts' for backward compatibility.
 
         Returns:
-            List of OmniRequestOutput objects, one for each input prompt.
-            Each output contains the stage_id, final_output_type, and
+            List of OmniRequestOutput objects (or generator if py_generator=True), one for 
+            each input prompt. Each output contains the stage_id, final_output_type, and
             the request_output from the final stage.
 
         Raises:
-            ValueError: If sampling_params_list is None or has incorrect length.
+            ValueError: If prompts is None or sampling_params_list has incorrect length.
         """
-        prompts = args[0] if args else kwargs.get("prompts")
-        sampling_params_list = args[1] if len(args) > 1 else kwargs.get("sampling_params_list")
-        py_generator = kwargs.get("py_generator", False)
+        # Handle backward compatibility with 'prompt' keyword
         if prompts is None:
-            if kwargs.get("prompt") is None:
-                raise ValueError("prompts is required for generation")
             prompts = kwargs.get("prompt")
+            if prompts is None:
+                raise ValueError("prompts is required for generation")
 
         if sampling_params_list is None:
             # For Omni LLM, the params are parsed via the yaml file. For the current version,

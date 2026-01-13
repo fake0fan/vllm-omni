@@ -233,125 +233,60 @@ class DiffusionCacheConfig:
 
 @dataclass
 class OmniDiffusionConfig:
-    # Model and path configuration (for convenience)
+    # Model and path configuration
     model: str | None = None
-
     model_class_name: str | None = None
-
     dtype: torch.dtype = torch.bfloat16
 
+    # Transformer configuration
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
-    # Attention
+    # Attention backend
     attention_backend: str | None = None
 
-    # Running mode
-    # mode: ExecutionMode = ExecutionMode.INFERENCE
-
-    # Workload type
-    # workload_type: WorkloadType = WorkloadType.T2V
-
-    # Cache strategy (legacy)
-    cache_strategy: str = "none"
+    # Parallel configuration
     parallel_config: DiffusionParallelConfig = field(default_factory=DiffusionParallelConfig)
 
-    # Cache backend configuration (NEW)
-    cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
+    # Cache backend configuration
+    cache_backend: str = "none"  # "tea_cache", "cache_dit", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
 
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
-    nccl_port: int | None = None
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None
-
     num_gpus: int | None = None
 
-    hsdp_replicate_dim: int = 1
-    hsdp_shard_dim: int = -1
-    dist_timeout: int | None = None  # timeout for torch.distributed
-
-    # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
-
-    # LoRA parameters
-    # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
-    lora_path: str | None = None
-    lora_nickname: str = "default"  # for swapping adapters in the pipeline
-    # can restrict layers to adapt, e.g. ["q_proj"]
-    # Will adapt only q, k, v, o by default.
-    lora_target_modules: list[str] | None = None
-
+    # Output type
     output_type: str = "pil"
 
-    # CPU offload parameters
-    # When enabled, DiT and encoders swap GPU access (mutual exclusion):
-    # - Text encoders run on GPU while DiT is on CPU
-    # - DiT runs on GPU while encoders are on CPU
+    # CPU offload - DiT and encoders swap GPU access (mutual exclusion)
     enable_cpu_offload: bool = False
-    use_fsdp_inference: bool = False
-    pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
 
-    # STA (Sliding Tile Attention) parameters
-    mask_strategy_file_path: str | None = None
-    # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
-    skip_time_steps: int = 15
-
     # Compilation
     enforce_eager: bool = False
 
-    # Enable sleep mode
+    # Enable sleep mode for GPU memory management
     enable_sleep_mode: bool = False
 
-    disable_autocast: bool = False
-
-    # VSA parameters
-    VSA_sparsity: float = 0.0  # inference/validation sparsity
-
-    # V-MoBA parameters
-    moba_config_path: str | None = None
-    # moba_config: dict[str, Any] = field(default_factory=dict)
-
     # Master port for distributed inference
-    # TODO: do not hard code
     master_port: int | None = None
 
-    # http server endpoint config, would be ignored in local mode
-    host: str | None = None
-    port: int | None = None
-
-    scheduler_port: int = 5555
-
-    # Stage verification
-    enable_stage_verification: bool = True
-
-    # Prompt text file for batch processing
-    prompt_file_path: str | None = None
-
-    # model paths for correct deallocation
-    model_paths: dict[str, str] = field(default_factory=dict)
-    model_loaded: dict[str, bool] = field(
-        default_factory=lambda: {
-            "transformer": True,
-            "vae": True,
-        }
-    )
+    # Override transformer class name for specific models
     override_transformer_cls_name: str | None = None
-
-    # # DMD parameters
-    # dmd_denoising_steps: List[int] | None = field(default=None)
 
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
     # Scheduler flow_shift for Wan2.2 (12.0 for 480p, 5.0 for 720p)
     flow_shift: float | None = None
 
-    # support multi images input
+    # Support multi images input
     supports_multimodal_inputs: bool = False
 
     # Logging
