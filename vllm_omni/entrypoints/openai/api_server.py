@@ -632,7 +632,7 @@ def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
 
 
 # Remove the original /v1/chat/completions route before registering our own
-# This prevents duplicate route registration warnings in FastAPI logs
+# This prevents duplicate route registration warnings in FastAPI logs.
 for route in router.routes[:]:
     if hasattr(route, "path") and route.path == "/v1/chat/completions":
         router.routes.remove(route)
