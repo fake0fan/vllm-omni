@@ -1,20 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+AsyncOmni: Asynchronous multi-stage engine client for vLLM-Omni.
+
+This module provides the async interface for multi-stage pipelines,
+inheriting from both OmniBase (for stage management) and
+MultiStageEngineClient (for EngineClient protocol compliance).
+"""
+
 import asyncio
 import time
 import weakref
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Iterable, Mapping
 from dataclasses import asdict
 from pprint import pformat
 from typing import Any
 
 from vllm.config import VllmConfig
+from vllm.inputs.data import PromptType
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.plugins.io_processors import get_io_processor
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.exceptions import EngineDeadError
 
 # Internal imports (our code)
@@ -23,11 +33,11 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
 from vllm_omni.distributed.ray_utils.utils import try_close_ray
 from vllm_omni.engine.input_processor import OmniInputProcessor
+from vllm_omni.engine.multi_stage_client import MultiStageEngineClient
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.log_utils import (
     OrchestratorMetrics,
 )
-from vllm_omni.entrypoints.omni import OmniBase
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
@@ -58,11 +68,17 @@ def _weak_close_cleanup_async(stage_list, stage_in_queues, ray_pg, output_handle
         output_handler.cancel()
 
 
-class AsyncOmni(OmniBase):
-    """Asynchronous unified entry point supporting multi-stage pipelines for LLM and Diffusion models.
+class AsyncOmni(MultiStageEngineClient):
+    """Asynchronous multi-stage engine client for vLLM-Omni.
 
-    Similar to the Omni class, but provides an asynchronous interface supporting
-    asynchronous LLM and Diffusion models.
+
+    The class orchestrates multiple stages (LLM, Audio, Diffusion, etc.) and
+    provides a unified async generate() interface that routes requests through
+    the pipeline.
+
+    Inheritance:
+        OmniBase: Provides stage initialization, queue management, connectors
+        MultiStageEngineClient: Provides EngineClient protocol implementation
 
     Args:
         *args: Variable length argument list.
@@ -72,21 +88,18 @@ class AsyncOmni(OmniBase):
             - stage_configs_path: Optional path to YAML file containing stage
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
-              be written to files with stage-specific suffixes.
-            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
-              when the previous stage finished (possibly a prior Omni run with GPU
-              reuse/overlap) to when the current stage starts to initialize.
+            - stage_init_timeout: Per-stage init watchdog (seconds).
             - shm_threshold_bytes: Threshold in bytes for using shared memory
-              for IPC. Objects larger than this threshold will use shared memory.
+              for IPC.
             - worker_backend: Backend for worker processes. Default is "multi_process".
-            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
+            - ray_address: Address of Ray cluster for Ray backend.
             - batch_timeout: Timeout in seconds for batching requests within a stage
             - init_timeout: Timeout in seconds for waiting for all stages to initialize
             - Additional keyword arguments passed to stage engines.
 
     Example:
-        >>> async_llm = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
-        >>> async for output in async_llm.generate(
+        >>> async_omni = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
+        >>> async for output in async_omni.generate(
         ...     prompt="Hello",
         ...     request_id="req-1",
         ...     sampling_params_list=[SamplingParams(), SamplingParams()]
@@ -186,42 +199,45 @@ class AsyncOmni(OmniBase):
         super()._process_stage_ready(stage, stage_id, result)
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
-        """Wait for all stages to report readiness."""
+        """Wait for all stages to report readiness and initialize client attributes."""
         super()._wait_for_stages_ready(timeout)
+
+        # Initialize processors from the first available LLM stage
         for stage in self.stage_list:
             if stage.vllm_config is not None and stage.tokenizer is not None:
                 try:
                     vllm_config = stage.vllm_config
                     tokenizer = stage.tokenizer
-                    # Initialize input_processor
-                    self.input_processor = OmniInputProcessor(
+
+                    # Initialize OmniInputProcessor
+                    self._input_processor = OmniInputProcessor(
                         vllm_config=vllm_config,
                         tokenizer=tokenizer,
                     )
-                    # Initialize model_config
-                    self.model_config = vllm_config.model_config
+
                     # Initialize io_processor
-                    io_processor_plugin = self.model_config.io_processor_plugin
-                    self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
+                    io_processor_plugin = vllm_config.model_config.io_processor_plugin
+                    self._io_processor = get_io_processor(vllm_config, io_processor_plugin)
 
                     logger.info(
-                        f"[{self._name}] Initialized input_processor, "
-                        f"io_processor, and model_config from stage-{stage.stage_id}",
+                        f"[{self._name}] Initialized input_processor and io_processor from stage-{stage.stage_id}",
                     )
                     break
                 except Exception as e:
                     logger.warning(
                         f"[{self._name}] Failed to initialize processors from stage-{stage.stage_id}: {e}",
                     )
-        # If no LLM stage found, set processors to None
-        if not hasattr(self, "input_processor") or self.input_processor is None:
+
+        # Initialize MultiStageEngineClient attributes from LLM stage
+        # This sets _vllm_config, _model_config, _tokenizer
+        self._init_from_llm_stage()
+
+        # Log warning if no LLM stage found
+        if self._vllm_config is None:
             logger.warning(
-                f"[{self._name}] No LLM stage found, processors will not be available. "
-                "This may cause issues with OpenAIServingModels."
+                f"[{self._name}] No LLM stage found, some EngineClient attributes will be None. "
+                "This may cause issues with OpenAI-compatible serving."
             )
-            self.input_processor = None
-            self.io_processor = None
-            self.model_config = None
 
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC.
@@ -232,39 +248,47 @@ class AsyncOmni(OmniBase):
         if hasattr(self, "_weak_finalizer"):
             self._weak_finalizer()
 
-    async def generate(self, *args: Any, **kwargs: dict[str, Any]) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Generate outputs for the given prompt asynchronously.
+    async def generate(
+        self,
+        prompt: EngineCoreRequest | PromptType = None,
+        sampling_params: SamplingParams = None,
+        request_id: str = None,
+        *,
+        prompt_text: str | None = None,
+        lora_request: LoRARequest | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        # Multi-stage specific parameters
+        sampling_params_list: list[Any] | None = None,
+        output_modalities: list[str] | None = None,
+    ) -> AsyncGenerator[OmniRequestOutput, None]:
+        """Generate outputs for the given prompt asynchronously through the multi-stage pipeline.
 
-        Coordinates multi-stage pipeline through YAML configuration.
-        Each stage will use AsyncOmniLLM or AsyncOmniDiffusion based on stage_type.
-        Processes the prompt through all stages in the pipeline and yields
-        outputs as they become available. Each stage uses its corresponding
-        sampling parameters from the sampling_params_list.
+        This method implements the EngineClient.generate() interface while supporting
+        multi-stage pipelines. It coordinates execution across multiple stages
+        (LLM, Audio, Diffusion, etc.) and yields outputs from each final_output stage.
 
         Args:
-            *args: Arguments for generation.
-                - prompt: Prompt to process. Can be a text string, token IDs,
-                    or multimodal prompt.
-                - request_id: Unique identifier for this request
-                - sampling_params_list: List of SamplingParams, one for each stage.
-                    Must have the same length as the number of stages.
-                    If None, uses default sampling params for each stage.
-            **kwargs: Additional arguments for generation.
-                - prompt: Prompt to process. Can be a text string, token IDs,
-                    or multimodal prompt.
-                - request_id: Unique identifier for this request
-                - sampling_params_list: List of SamplingParams, one for each stage.
-                    Must have the same length as the number of stages.
-                    If None, uses default sampling params for each stage.
-                - output_modalities: Optional list of output modalities.
+            prompt: Input prompt (text, token IDs, or multimodal content)
+            sampling_params: Sampling parameters for the first LLM stage
+            request_id: Unique identifier for this request
+            prompt_text: Optional prompt text for logging
+            lora_request: Optional LoRA adapter request
+            tokenization_kwargs: Optional tokenization parameters
+            trace_headers: Optional trace headers for observability
+            priority: Request priority
+            data_parallel_rank: Optional data parallel rank
+            sampling_params_list: List of parameters for each stage (overrides sampling_params)
+            output_modalities: Desired output modalities (e.g., ["text", "audio", "image"])
 
         Yields:
-            OmniRequestOutput objects as they are produced by each stage.
-            Each output contains the stage_id, final_output_type, and
-            the request_output from that stage.
+            OmniRequestOutput objects from each final_output stage
 
         Raises:
-            ValueError: If sampling_params_list has incorrect length.
+            ValueError: If sampling_params_list has incorrect length
+            RuntimeError: If stage forwarding fails
         """
         # Wait until generation is resumed if the engine is paused.
         async with self._pause_cond:
@@ -274,31 +298,23 @@ class AsyncOmni(OmniBase):
         try:
             # Start output handler on the first call to generate()
             self._run_output_handler()
-
-            prompt = args[0] if args else kwargs.get("prompt")
-            request_id = args[1] if len(args) > 1 else kwargs.get("request_id")
-            sampling_params_list = args[2] if len(args) > 2 else kwargs.get("sampling_params_list")
-            output_modalities = kwargs.get("output_modalities", None)
             # TODO: lora_request, trace_headers, priority are not supported yet
 
             if sampling_params_list is None:
-                # For Omni LLM, the params are parsed via the yaml file. For the current version,
-                # diffusion params can parsed via the command line.
-                omni_params_kwargs = {
-                    k: v for k, v in kwargs.items() if k not in ["prompt", "request_id", "output_modalities"]
-                }
-
+                # Build default sampling_params_list from stage configurations
+                # If sampling_params is provided, use it for the first LLM stage
                 per_stage_params: list[Any] = []
                 for stage_id, stage in enumerate(self.stage_list):
                     stage_type = getattr(stage, "stage_type", "llm")
                     if stage_type == "diffusion":
+                        # Use default diffusion params
                         default_dict = self.default_sampling_params_list[stage_id]
-                        # Merge user-provided kwargs
-                        merged = {**default_dict, **omni_params_kwargs}
-                        # Diffusion only needs to keep diff params, will be used via OmniDiffusionRequest
-                        per_stage_params.append(merged)
+                        per_stage_params.append(default_dict)
+                    elif stage_type == "llm" and stage_id == 0 and sampling_params is not None:
+                        # Use provided sampling_params for first LLM stage
+                        per_stage_params.append(sampling_params)
                     else:
-                        # LLM directly constructs SamplingParams, don't use the merged params
+                        # Use default params from YAML config
                         per_stage_params.append(self.default_sampling_params_list[stage_id])
 
                 sampling_params_list = per_stage_params
@@ -517,30 +533,70 @@ class AsyncOmni(OmniBase):
 
         self.output_handler = asyncio.create_task(output_handler())
 
+    # ========== Properties (override MultiStageEngineClient) ==========
+
     @property
     def is_running(self) -> bool:
-        # Is None before the loop is started.
+        """Check if any stage is running."""
         return len(self._stage_in_queues) > 0
 
     @property
     def is_stopped(self) -> bool:
+        """Check if the engine is stopped."""
         return self.errored
 
     @property
     def errored(self) -> bool:
+        """Check if any stage has errored."""
         return not self.is_running
 
     @property
     def _name(self) -> str:
+        """Internal name for logging."""
         return "AsyncOrchestrator"
 
     @property
     def is_async(self) -> bool:
+        """Return True since this is the async client."""
         return True
 
     @property
     def dead_error(self) -> BaseException:
+        """Return the error to raise when the engine is dead."""
         return EngineDeadError()
+
+    # ========== Backward Compatibility Properties ==========
+    # These provide compatibility with code that accesses these directly
+
+    @property
+    def input_processor(self) -> Any:
+        """Backward compatible access to input_processor."""
+        return self._input_processor
+
+    @input_processor.setter
+    def input_processor(self, value: Any) -> None:
+        """Allow setting input_processor for backward compatibility."""
+        self._input_processor = value
+
+    @property
+    def io_processor(self) -> Any:
+        """Backward compatible access to io_processor."""
+        return self._io_processor
+
+    @io_processor.setter
+    def io_processor(self, value: Any) -> None:
+        """Allow setting io_processor for backward compatibility."""
+        self._io_processor = value
+
+    @property
+    def model_config(self) -> Any:
+        """Backward compatible access to model_config."""
+        return self._model_config
+
+    @model_config.setter
+    def model_config(self, value: Any) -> None:
+        """Allow setting model_config for backward compatibility."""
+        self._model_config = value
 
     async def abort(self, request_id: str | Iterable[str]) -> None:
         abort_task = {"type": OmniStageTaskType.ABORT, "request_id": request_id}

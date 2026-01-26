@@ -82,6 +82,20 @@ def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return SharedMemoryConnector(config)
 
 
+def _create_zmq_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    try:
+        from .connectors.zmq_connector import ZMQConnector
+    except ImportError:
+        # Fallback import
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from omni_connectors.connectors.zmq_connector import ZMQConnector
+    return ZMQConnector(config)
+
+
 # Register connectors
 OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
+OmniConnectorFactory.register_connector("ZMQConnector", _create_zmq_connector)

@@ -1,5 +1,18 @@
 """
 Engine components for vLLM-Omni.
+
+This module provides the core engine components for multi-stage pipelines,
+extending vLLM's engine architecture:
+
+- MultiStageEngineClient: Base class for orchestrating multiple stages
+- StageCoreProc: Extended EngineCore for individual stages (reuses vLLM's EngineCore)
+- StageAsyncMPClient: Extended AsyncMPClient for stage communication
+- MultiStageCoreClient: Manager for multiple stage clients
+
+Key design principle: Maximize reuse of vLLM's infrastructure
+- Uses vLLM's EngineCoreProc as base for StageCoreProc
+- Uses vLLM's AsyncMPClient as base for StageAsyncMPClient
+- Uses vLLM's ZMQ setup, serialization, and resource management
 """
 
 from typing import Any
@@ -11,6 +24,38 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
 )
+
+from vllm_omni.engine.multi_stage_client import (
+    CommunicationMode,
+    MultiStageEngineClient,
+)
+from vllm_omni.engine.stage_core import (
+    StageCoreProc,
+    launch_stage_core,
+)
+from vllm_omni.engine.stage_core_client import (
+    MultiStageCoreClient,
+    StageAsyncMPClient,
+)
+
+__all__ = [
+    # Multi-stage client
+    "MultiStageEngineClient",
+    "CommunicationMode",
+    # StageCore (extends vLLM's EngineCoreProc)
+    "StageCoreProc",
+    "launch_stage_core",
+    # StageCore client (extends vLLM's AsyncMPClient)
+    "StageAsyncMPClient",
+    "MultiStageCoreClient",
+    # Omni-specific payloads
+    "PromptEmbedsPayload",
+    "AdditionalInformationEntry",
+    "AdditionalInformationPayload",
+    "OmniEngineCoreRequest",
+    "OmniEngineCoreOutput",
+    "OmniEngineCoreOutputs",
+]
 
 
 class PromptEmbedsPayload(msgspec.Struct):
