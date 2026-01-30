@@ -141,7 +141,9 @@ Configuration for disaggregated execution of the stage, controlling how the stag
 
 #### `runtime.process`
 
-Whether to run this stage in a separate process. When set to `true`, the stage will be executed in an isolated process, enabling better resource isolation and parallel execution across different stages. This is essential for multi-GPU deployments where different stages run on different devices.
+Whether to run this stage in a separate process. When set to `true` (default), the stage will be executed in an isolated process, enabling better resource isolation and parallel execution across different stages. This is essential for multi-GPU deployments where different stages run on different devices.
+
+When set to `false`, the stage worker loop runs in a **thread** within the orchestrator process (no extra OmniStage process). The underlying LLM/EngineCore still runs in its own process (e.g. vLLM's EngineCore); only the thin orchestration layer (queue → engine.generate() → queue) runs in-process. Use this to reduce process count when all in-process stages can share the same device(s), since `CUDA_VISIBLE_DEVICES` is process-global. Not supported when `worker_backend` is `"ray"`.
 
 Default: `true`
 

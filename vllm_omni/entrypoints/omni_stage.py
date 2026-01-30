@@ -13,11 +13,12 @@ import multiprocessing as mp
 import os
 import queue
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Sequence
 from dataclasses import fields
-from typing import Any, Literal, cast
+from typing import Any, Literal, Union, cast
 
 from vllm import PromptType, RequestOutput
 from vllm.inputs import TextPrompt
@@ -137,9 +138,11 @@ class OmniStage:
         except TypeError as error:
             raise TypeError(f"Invalid default_sampling_params for stage {self.stage_id}: {error}") from error
         # Runtime orchestration state (added)
-        self._in_q: mp.Queue | None = None
-        self._out_q: mp.Queue | None = None
-        self._proc: mp.Process | None = None
+        # Queues can be mp.Queue (process) or queue.Queue (in-process thread)
+        self._in_q: mp.Queue | queue.Queue | None = None
+        self._out_q: mp.Queue | queue.Queue | None = None
+        self._proc: Union[mp.Process, None] = None
+        self._thread: Union[threading.Thread, None] = None
         self._shm_threshold_bytes: int = 65536
         self._stage_init_timeout: int = stage_init_timeout
 
@@ -200,11 +203,11 @@ class OmniStage:
         self.engine_outputs = engine_outputs
 
     # ----------------- New Orchestration APIs -----------------
-    def attach_queues(self, in_q: mp.Queue, out_q: mp.Queue) -> None:
+    def attach_queues(self, in_q: Union[mp.Queue, queue.Queue], out_q: Union[mp.Queue, queue.Queue]) -> None:
         """Attach input and output queues for IPC communication.
 
         Args:
-            in_q: Input queue for receiving tasks from orchestrator
+            in_q: Input queue for receiving tasks from orchestrator (mp.Queue or queue.Queue for in-process)
             out_q: Output queue for sending results to orchestrator
         """
         self._in_q = in_q
@@ -285,6 +288,9 @@ class OmniStage:
         # Prepare lightweight dict config for worker
         engine_args = _to_dict(self.engine_args)
         runtime_cfg = _to_dict(getattr(self.stage_config, "runtime", {}))
+        # use_process = runtime_cfg.get("process", False)
+        use_process = False
+        logger.info(f"[Stage-{self.stage_id}] use_process: {use_process}")
         stage_payload: dict[str, Any] = {
             "stage_id": self.stage_id,
             "engine_args": engine_args,
@@ -322,6 +328,40 @@ class OmniStage:
                         batch_timeout=batch_timeout,
                         stage_init_timeout=self._stage_init_timeout,
                     )
+            elif not use_process:
+                # In-process: run stage worker in a thread. Underlying LLM/EngineCore still runs in
+                # its own process (e.g. EngineCoreClient.make_async_mp_client). When using multiple
+                # in-process stages, they share one process so CUDA_VISIBLE_DEVICES is global;
+                # use the same devices for all in-process stages or a single in-process stage.
+                logger.info("[Stage-%s] Starting in-process worker (runtime.process=false)", self.stage_id)
+                if is_async:
+                    self._thread = threading.Thread(
+                        target=_stage_worker_async_entry,
+                        args=(
+                            self,
+                            model,
+                            stage_payload,
+                            batch_timeout,
+                            self._stage_init_timeout,
+                        ),
+                        name=f"OmniStage-{self.stage_id}-async",
+                        daemon=False,
+                    )
+                else:
+                    self._thread = threading.Thread(
+                        target=_stage_worker,
+                        args=(
+                            model,
+                            stage_payload,
+                            self._in_q,
+                            self._out_q,
+                            batch_timeout,
+                            self._stage_init_timeout,
+                        ),
+                        name=f"OmniStage-{self.stage_id}",
+                        daemon=False,
+                    )
+                self._thread.start()
             else:
                 if is_async:
                     self._proc = ctx.Process(
@@ -354,11 +394,11 @@ class OmniStage:
                 os.environ["VLLM_LOGGING_PREFIX"] = old_env
 
     def stop_stage_worker(self) -> None:
-        """Stop the stage worker process gracefully.
+        """Stop the stage worker process or thread gracefully.
 
         Sends shutdown signal to the worker and waits for it to terminate.
         If graceful shutdown fails, forcefully terminates the process.
-        Handles both multiprocessing Process and Ray Actor.
+        Handles multiprocessing Process, Ray Actor, and in-process Thread.
         """
         if self._in_q is not None:
             try:
@@ -369,6 +409,12 @@ class OmniStage:
         if hasattr(self, "_ray_actor") and self._ray_actor:
             kill_ray_actor(self._ray_actor)
             self._ray_actor = None
+        elif self._thread is not None:
+            try:
+                self._thread.join(timeout=5)
+            except Exception as e:
+                logger.debug("thread join() failed: %s", e)
+            self._thread = None
         elif self._proc is not None:
             try:
                 self._proc.join(timeout=5)

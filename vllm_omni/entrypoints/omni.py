@@ -3,6 +3,7 @@
 import json
 import multiprocessing as mp
 import os
+import queue
 import time
 import uuid
 import weakref
@@ -282,7 +283,7 @@ class OmniBase:
         return bool(getattr(engine_args, "async_chunk", False))
 
     def _start_stages(self, model: str) -> None:
-        """Start all stage processes."""
+        """Start all stage processes or in-process threads (when runtime.process=false)."""
         if self.worker_backend == "ray":
             # Initialize Ray Cluster
             self._ray_pg = create_placement_group(
@@ -290,8 +291,21 @@ class OmniBase:
             )
 
         for stage_id, stage in enumerate[OmniStage](self.stage_list):
-            in_q = self._queue_cls()
-            out_q = self._queue_cls()
+            # Use thread-safe queue.Queue for in-process stages (runtime.process=false)
+            runtime = getattr(stage.stage_config, "runtime", None)
+            if runtime is not None and not isinstance(runtime, dict):
+                use_process = getattr(runtime, "process", True)
+            elif isinstance(runtime, dict):
+                use_process = runtime.get("process", True)
+            else:
+                use_process = True
+            if self.worker_backend != "ray" and not use_process:
+                in_q = queue.Queue()
+                out_q = queue.Queue()
+                logger.debug(f"[{self._name}] Stage-{stage_id} using in-process queues (runtime.process=false)")
+            else:
+                in_q = self._queue_cls()
+                out_q = self._queue_cls()
             self._stage_in_queues.append(in_q)
             self._stage_out_queues.append(out_q)
             stage.attach_queues(in_q, out_q)
