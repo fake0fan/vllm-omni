@@ -108,7 +108,7 @@ async def async_request_openai_chat_omni_completions(
     output.prompt_len = request_func_input.prompt_len
 
     generated_text = ""
-    generated_audio = ""
+    generated_audio = None
     ttft = 0.0
     st = time.perf_counter()
     output.start_time = st

@@ -18,7 +18,7 @@ import time
 import traceback
 from collections.abc import Sequence
 from dataclasses import fields
-from typing import Any, Literal, Union, cast
+from typing import Any, Literal, cast
 
 from vllm import PromptType, RequestOutput
 from vllm.inputs import TextPrompt
@@ -141,8 +141,8 @@ class OmniStage:
         # Queues can be mp.Queue (process) or queue.Queue (in-process thread)
         self._in_q: mp.Queue | queue.Queue | None = None
         self._out_q: mp.Queue | queue.Queue | None = None
-        self._proc: Union[mp.Process, None] = None
-        self._thread: Union[threading.Thread, None] = None
+        self._proc: mp.Process | None = None
+        self._thread: threading.Thread | None = None
         self._shm_threshold_bytes: int = 65536
         self._stage_init_timeout: int = stage_init_timeout
 
@@ -203,7 +203,7 @@ class OmniStage:
         self.engine_outputs = engine_outputs
 
     # ----------------- New Orchestration APIs -----------------
-    def attach_queues(self, in_q: Union[mp.Queue, queue.Queue], out_q: Union[mp.Queue, queue.Queue]) -> None:
+    def attach_queues(self, in_q: mp.Queue | queue.Queue, out_q: mp.Queue | queue.Queue) -> None:
         """Attach input and output queues for IPC communication.
 
         Args:
@@ -288,8 +288,7 @@ class OmniStage:
         # Prepare lightweight dict config for worker
         engine_args = _to_dict(self.engine_args)
         runtime_cfg = _to_dict(getattr(self.stage_config, "runtime", {}))
-        # use_process = runtime_cfg.get("process", False)
-        use_process = False
+        use_process = runtime_cfg.get("process", False)
         logger.info(f"[Stage-{self.stage_id}] use_process: {use_process}")
         stage_payload: dict[str, Any] = {
             "stage_id": self.stage_id,
