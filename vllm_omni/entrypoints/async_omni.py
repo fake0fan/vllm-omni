@@ -153,6 +153,7 @@ class AsyncOmni(OmniBase):
                 "stage_id": 0,
                 "stage_type": "diffusion",
                 "runtime": {
+                    "process": True,
                     "devices": devices,
                     "max_batch_size": 1,
                 },

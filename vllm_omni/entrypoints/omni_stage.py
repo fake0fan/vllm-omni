@@ -6,6 +6,8 @@ Enhanced to encapsulate per-stage process lifecycle and worker logic
 the original input processing utilities for cross-stage data wiring.
 """
 
+from __future__ import annotations
+
 import asyncio
 import fcntl
 import importlib
