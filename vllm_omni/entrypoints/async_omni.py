@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import copy
+import os
 import time
 import weakref
 from collections.abc import AsyncGenerator, Iterable, Sequence
@@ -269,6 +270,17 @@ class AsyncOmni(OmniBase):
         Raises:
             ValueError: If sampling_params_list has incorrect length.
         """
+        # Check if new architecture is enabled via feature flag
+        use_new_architecture = os.environ.get("VLLM_OMNI_USE_NEW_ARCHITECTURE", "0") == "1"
+
+        if use_new_architecture:
+            # Delegate to new MultiStageEngineClient architecture
+            async for output in self._generate_new_architecture(
+                prompt, request_id, sampling_params_list, output_modalities
+            ):
+                yield output
+            return
+
         # Wait until generation is resumed if the engine is paused.
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
@@ -360,6 +372,122 @@ class AsyncOmni(OmniBase):
             await self.abort(request_id)
             logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
             raise
+
+    async def _generate_new_architecture(
+        self,
+        prompt: OmniPromptType,
+        request_id: str,
+        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
+        output_modalities: list[str] | None = None,
+    ) -> AsyncGenerator[OmniRequestOutput, None]:
+        """Generate using new MultiStageEngineClient architecture.
+
+        This method is called when VLLM_OMNI_USE_NEW_ARCHITECTURE=1 is set.
+        It delegates to the new ZMQ-based architecture with PipelineOrchestrator.
+
+        Args:
+            prompt: Input prompt
+            request_id: Unique request identifier
+            sampling_params_list: List of sampling params for each stage
+            output_modalities: Optional output modalities
+
+        Yields:
+            OmniRequestOutput instances
+        """
+        logger.info(f"[{self._name}] Using new architecture for request {request_id}")
+
+        # Lazy initialization of MultiStageEngineClient
+        if not hasattr(self, "_multi_stage_client"):
+            self._init_multi_stage_client()
+
+        # Use default sampling params if not provided
+        if sampling_params_list is None:
+            sampling_params_list = self.default_sampling_params_list
+
+        if len(sampling_params_list) != len(self.stage_list):
+            raise ValueError(
+                f"Expected {len(self.stage_list)} sampling params, "
+                f"got {len(sampling_params_list)}"
+            )
+
+        # Delegate to MultiStageEngineClient
+        try:
+            async for output in self._multi_stage_client.generate(
+                prompt=prompt,
+                sampling_params=sampling_params_list[0],  # Stage 0 params
+                request_id=request_id,
+            ):
+                # Convert RequestOutput to OmniRequestOutput if needed
+                if isinstance(output, OmniRequestOutput):
+                    yield output
+                else:
+                    # Wrap in OmniRequestOutput
+                    yield OmniRequestOutput(
+                        request_id=request_id,
+                        request_output=output,
+                        finished=output.finished if hasattr(output, "finished") else True,
+                    )
+        except Exception as e:
+            logger.exception(f"[{self._name}] Error in new architecture for {request_id}")
+            raise
+
+    def _init_multi_stage_client(self):
+        """Initialize MultiStageEngineClient for new architecture.
+
+        This is called lazily on first use of the new architecture.
+        """
+        from vllm_omni.entrypoints.multi_stage_engine_client import (
+            MultiStageEngineClient,
+        )
+        from vllm_omni.entrypoints.stage_context import StageContext
+        from vllm_omni.entrypoints.stage_engine.stage_core_client import (
+            StageEngineCoreClient,
+        )
+
+        logger.info(f"[{self._name}] Initializing MultiStageEngineClient")
+
+        # Create StageContext for each stage
+        stage_contexts = []
+        for stage_id, stage_config in enumerate(self.stage_list):
+            # Create ZMQ addresses for this stage
+            input_address = f"tcp://127.0.0.1:{5555 + stage_id * 2}"
+            output_address = f"tcp://127.0.0.1:{5556 + stage_id * 2}"
+
+            # Create StageEngineCoreClient
+            client = StageEngineCoreClient(
+                stage_id=stage_id,
+                input_address=input_address,
+                output_address=output_address,
+            )
+
+            # Start client
+            asyncio.create_task(client.start())
+
+            # Create StageContext
+            stage_ctx = StageContext(
+                stage_id=stage_id,
+                stage_config=stage_config,
+                client=client,
+                connectors=self.connectors,
+                is_final_output=getattr(stage_config, "final_output", False),
+                final_output_type=getattr(stage_config, "final_output_type", None),
+            )
+            stage_contexts.append(stage_ctx)
+
+        # Determine execution mode
+        execution_mode = "async_chunk" if self.async_chunk else "sequential"
+
+        # Create MultiStageEngineClient
+        self._multi_stage_client = MultiStageEngineClient(
+            stages=stage_contexts,
+            execution_mode=execution_mode,
+        )
+
+        logger.info(
+            f"[{self._name}] MultiStageEngineClient initialized with "
+            f"{len(stage_contexts)} stages, mode={execution_mode}"
+        )
+
 
     async def _process_async_results(
         self,
