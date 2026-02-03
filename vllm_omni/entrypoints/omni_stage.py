@@ -579,12 +579,29 @@ def _stage_worker(
     _batch_seq = 0
 
     # Device mapping
+    # When use_process=false (in-process/thread mode), multiple stages share the same
+    # process, so we cannot modify CUDA_VISIBLE_DEVICES at this level. Instead, we pass
+    # the device info to the engine_args and let EngineCoreProc set it in its subprocess.
+    use_process = runtime_cfg.get("process", True)
     device_type = None
+    stage_devices = runtime_cfg.get("devices")
     try:
         from vllm_omni.platforms import current_omni_platform
 
         device_type = current_omni_platform.device_type
-        set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
+        if use_process:
+            # Independent process mode: set device visibility here
+            set_stage_devices(stage_id, stage_devices, device_type=device_type)
+        else:
+            # In-process mode: pass device info to engine_args for EngineCoreProc to handle
+            if stage_devices is not None:
+                engine_args["_omni_stage_devices"] = stage_devices
+                engine_args["_omni_stage_id"] = stage_id
+                logger.info(
+                    "[Stage-%s] In-process mode: deferring device setup to EngineCoreProc (devices=%s)",
+                    stage_id,
+                    stage_devices,
+                )
     except Exception as e:
         logger.warning("Device setup failed: %s", e)
 
@@ -723,6 +740,32 @@ def _stage_worker(
             stage_id,
             e,
         )
+
+    # Extract omni stage device info before creating engine args
+    # These are set in in-process mode to defer device setup to EngineCoreProc
+    omni_stage_devices = engine_args.pop("_omni_stage_devices", None)
+    omni_stage_id_for_device = engine_args.pop("_omni_stage_id", None)
+
+    # Prepare device environment context for engine creation
+    # In in-process mode, we temporarily set CUDA_VISIBLE_DEVICES before creating the engine
+    # so that EngineCoreProc subprocess inherits the correct device visibility
+    _saved_device_env = None
+    _device_env_var = None
+    if omni_stage_devices is not None:
+        try:
+            from vllm_omni.platforms import current_omni_platform
+            _device_env_var = current_omni_platform.device_control_env_var
+            _saved_device_env = _os.environ.get(_device_env_var)
+            _os.environ[_device_env_var] = str(omni_stage_devices)
+            logger.info(
+                "[Stage-%s] Temporarily set %s=%s for EngineCoreProc subprocess",
+                stage_id,
+                _device_env_var,
+                omni_stage_devices,
+            )
+        except Exception as e:
+            logger.warning("[Stage-%s] Failed to set device env for subprocess: %s", stage_id, e)
+
     # Init engine based on stage_type
     logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
     if engine_args.get("async_chunk", False):
@@ -747,6 +790,20 @@ def _stage_worker(
             # Default to LLM engine
             stage_engine = OmniLLM(model=model, **engine_args)
     finally:
+        # Restore device environment variable after engine creation
+        # The EngineCoreProc subprocess has already inherited the modified env
+        if _device_env_var is not None:
+            if _saved_device_env is None:
+                _os.environ.pop(_device_env_var, None)
+            else:
+                _os.environ[_device_env_var] = _saved_device_env
+            logger.debug(
+                "[Stage-%s] Restored %s to %s",
+                stage_id,
+                _device_env_var,
+                _saved_device_env,
+            )
+
         # Release all locks by closing file descriptors
         # Locks are automatically released when file descriptors are closed
         # or when process dies
@@ -1104,12 +1161,29 @@ async def _stage_worker_async(
     _batch_seq = 0
 
     # Device mapping
+    # When use_process=false (in-process/thread mode), multiple stages share the same
+    # process, so we cannot modify CUDA_VISIBLE_DEVICES at this level. Instead, we pass
+    # the device info to the engine_args and let EngineCoreProc set it in its subprocess.
+    use_process = runtime_cfg.get("process", True)
     device_type = None
+    stage_devices = runtime_cfg.get("devices")
     try:
         from vllm_omni.platforms import current_omni_platform
 
         device_type = current_omni_platform.device_type
-        set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
+        if use_process:
+            # Independent process mode: set device visibility here
+            set_stage_devices(stage_id, stage_devices, device_type=device_type)
+        else:
+            # In-process mode: pass device info to engine_args for EngineCoreProc to handle
+            if stage_devices is not None:
+                engine_args["_omni_stage_devices"] = stage_devices
+                engine_args["_omni_stage_id"] = stage_id
+                logger.info(
+                    "[Stage-%s] In-process mode: deferring device setup to EngineCoreProc (devices=%s)",
+                    stage_id,
+                    stage_devices,
+                )
     except Exception as e:
         logger.warning("Device setup failed: %s", e)
 
@@ -1257,6 +1331,31 @@ async def _stage_worker_async(
     except Exception as e:
         logger.debug("Failed to set up sequential initialization lock: %s", e)
 
+    # Extract omni stage device info before creating engine args
+    # These are set in in-process mode to defer device setup to EngineCoreProc
+    omni_stage_devices = engine_args.pop("_omni_stage_devices", None)
+    omni_stage_id_for_device = engine_args.pop("_omni_stage_id", None)
+
+    # Prepare device environment context for engine creation
+    # In in-process mode, we temporarily set CUDA_VISIBLE_DEVICES before creating the engine
+    # so that EngineCoreProc subprocess inherits the correct device visibility
+    _saved_device_env = None
+    _device_env_var = None
+    if omni_stage_devices is not None:
+        try:
+            from vllm_omni.platforms import current_omni_platform
+            _device_env_var = current_omni_platform.device_control_env_var
+            _saved_device_env = _os.environ.get(_device_env_var)
+            _os.environ[_device_env_var] = str(omni_stage_devices)
+            logger.info(
+                "[Stage-%s] Temporarily set %s=%s for EngineCoreProc subprocess",
+                stage_id,
+                _device_env_var,
+                omni_stage_devices,
+            )
+        except Exception as e:
+            logger.warning("[Stage-%s] Failed to set device env for subprocess: %s", stage_id, e)
+
     # Init engine based on stage_type
     logger.debug(
         "[Stage-%s] Initializing %s engine with args keys=%s",
@@ -1300,6 +1399,20 @@ async def _stage_worker_async(
                 engine_args=omni_engine_args,
             )
     finally:
+        # Restore device environment variable after engine creation
+        # The EngineCoreProc subprocess has already inherited the modified env
+        if _device_env_var is not None:
+            if _saved_device_env is None:
+                _os.environ.pop(_device_env_var, None)
+            else:
+                _os.environ[_device_env_var] = _saved_device_env
+            logger.debug(
+                "[Stage-%s] Restored %s to %s",
+                stage_id,
+                _device_env_var,
+                _saved_device_env,
+            )
+
         # Release all locks by closing file descriptors
         # Locks are automatically released when file descriptors are closed
         # or when process dies
