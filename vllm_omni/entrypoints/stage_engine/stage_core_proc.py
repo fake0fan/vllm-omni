@@ -13,9 +13,10 @@ import signal
 import threading
 import time
 from contextlib import ExitStack
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import zmq
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
@@ -26,6 +27,9 @@ from vllm_omni.entrypoints.stage_engine.stage_serialization import (
 )
 from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+
+if TYPE_CHECKING:
+    from vllm.v1.executor import Executor
 
 logger = init_logger(__name__)
 
@@ -49,36 +53,47 @@ class StageEngineCoreProc:
     - DEALER socket for receiving requests from orchestrator
     - PUSH socket for sending outputs to orchestrator
 
+    This follows vLLM's EngineCoreProc pattern (vllm/v1/engine/core.py).
+
     Attributes:
         stage_id: Unique identifier for this stage
-        stage_config: Configuration for this stage
+        stage_type: Type of stage ("llm", "diffusion", "audio")
         input_address: ZMQ address for receiving requests (DEALER)
         output_address: ZMQ address for sending outputs (PUSH)
+        vllm_config: VllmConfig for LLM stages
+        executor_class: Executor class for the stage process
+        log_stats: Whether to log statistics
         engine: The underlying AsyncOmniLLM or AsyncOmniDiffusion engine
     """
 
     def __init__(
         self,
         stage_id: int,
-        stage_config: Any,
+        stage_type: str,
         input_address: str,
         output_address: str,
-        stage_type: str = "llm",
+        vllm_config: VllmConfig | None = None,
+        executor_class: type["Executor"] | None = None,
+        log_stats: bool = False,
     ):
         """Initialize the stage engine process.
 
         Args:
             stage_id: Unique identifier for this stage
-            stage_config: Configuration for this stage
+            stage_type: Type of stage ("llm", "diffusion", "audio")
             input_address: ZMQ address for receiving requests
             output_address: ZMQ address for sending outputs
-            stage_type: Type of stage ("llm" or "diffusion")
+            vllm_config: VllmConfig for LLM stages (None for non-LLM stages)
+            executor_class: Executor class for the stage process
+            log_stats: Whether to log statistics
         """
         self.stage_id = stage_id
-        self.stage_config = stage_config
+        self.stage_type = stage_type
         self.input_address = input_address
         self.output_address = output_address
-        self.stage_type = stage_type
+        self.vllm_config = vllm_config
+        self.executor_class = executor_class
+        self.log_stats = log_stats
 
         # Queues for request/output handling
         self.input_queue: queue.Queue[tuple[bytes, Any]] = queue.Queue()
@@ -97,19 +112,26 @@ class StageEngineCoreProc:
     @staticmethod
     def run_stage_worker(
         stage_id: int,
-        stage_config: Any,
+        stage_type: str,
         input_address: str,
         output_address: str,
-        stage_type: str = "llm",
+        vllm_config: VllmConfig | None = None,
+        executor_class: type["Executor"] | None = None,
+        log_stats: bool = False,
     ):
         """Entry point for running stage worker in background process.
 
+        This is called by StageEngineCoreClient.make_client() to start the
+        background process. Similar to vLLM's EngineCoreProc.run_engine_core().
+
         Args:
             stage_id: Unique identifier for this stage
-            stage_config: Configuration for this stage
-            input_address: ZMQ address for receiving requests
-            output_address: ZMQ address for sending outputs
-            stage_type: Type of stage ("llm" or "diffusion")
+            stage_type: Type of stage ("llm", "diffusion", "audio")
+            input_address: ZMQ address for receiving requests (DEALER connects here)
+            output_address: ZMQ address for sending outputs (PUSH connects here)
+            vllm_config: VllmConfig for LLM stages (None for non-LLM stages)
+            executor_class: Executor class for the stage process
+            log_stats: Whether to log statistics
         """
         # Signal handler for graceful shutdown
         shutdown_requested = False
@@ -127,7 +149,13 @@ class StageEngineCoreProc:
         try:
             logger.info(f"Starting stage {stage_id} worker process (type={stage_type})")
             proc = StageEngineCoreProc(
-                stage_id, stage_config, input_address, output_address, stage_type
+                stage_id=stage_id,
+                stage_type=stage_type,
+                input_address=input_address,
+                output_address=output_address,
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=log_stats,
             )
             proc.run_stage_loop()
         except SystemExit:
@@ -174,25 +202,37 @@ class StageEngineCoreProc:
             asyncio.run(self._async_main_loop())
 
     def _init_engine(self):
-        """Initialize the stage engine (AsyncOmniLLM or AsyncOmniDiffusion)."""
-        engine_args = self.stage_config.engine_args
+        """Initialize the stage engine (AsyncOmniLLM or AsyncOmniDiffusion).
 
+        Uses vllm_config and executor_class passed from StageEngineCoreClient.
+        """
         if self.stage_type == "llm":
-            # Initialize AsyncOmniLLM
+            if self.vllm_config is None:
+                raise ValueError("vllm_config is required for LLM stage")
+            # Initialize AsyncOmniLLM with vllm_config
+            # Use the executor_class if provided, otherwise get from vllm_config
+            executor_cls = self.executor_class
+            if executor_cls is None:
+                from vllm.v1.executor import Executor
+                executor_cls = Executor.get_class(self.vllm_config)
             self.engine = AsyncOmniLLM(
-                model=engine_args.model,
-                **engine_args.to_dict(),
+                vllm_config=self.vllm_config,
+                executor_class=executor_cls,
+                log_stats=self.log_stats,
             )
         elif self.stage_type == "diffusion":
             # Initialize AsyncOmniDiffusion
+            # AsyncOmniDiffusion uses od_config, not vllm_config
             self.engine = AsyncOmniDiffusion(
-                model=engine_args.model,
-                **engine_args.to_dict(),
+                od_config=self.vllm_config,  # Pass as od_config
             )
+        elif self.stage_type == "audio":
+            # TODO: Initialize audio stage engine
+            raise NotImplementedError("Audio stage not yet implemented")
         else:
             raise ValueError(f"Unknown stage type: {self.stage_type}")
 
-        logger.info(f"Stage {self.stage_id} engine initialized")
+        logger.info(f"Stage {self.stage_id} engine initialized (type={self.stage_type})")
 
     async def _async_main_loop(self):
         """Async main loop for processing requests."""

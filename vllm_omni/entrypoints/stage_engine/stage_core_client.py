@@ -1,19 +1,32 @@
-"""ZMQ-based client for communicating with stage engine processes.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""ZMQ-based client for communicating with non-LLM stage engine processes.
 
-This module provides StageEngineCoreClient, a ZMQ-based client for submitting
+This module provides NonLLMStageClient, a ZMQ-based client for submitting
 requests to and receiving outputs from StageEngineCoreProc workers.
+
+For LLM stages, use vLLM's EngineCoreClient.make_async_mp_client() directly.
+For non-LLM stages (Diffusion, Audio), use NonLLMStageClient.
 
 Based on vLLM's AsyncMPClient pattern (vllm/v1/engine/core_client.py).
 """
 
+from __future__ import annotations
+
 import asyncio
-import uuid
-from typing import Any, AsyncGenerator
+import multiprocessing
+import weakref
+from typing import TYPE_CHECKING, Any
 
 import zmq
 import zmq.asyncio
+
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.entrypoints.stage_engine.stage_client_protocol import (
+    BaseStageClient,
+)
 from vllm_omni.entrypoints.stage_engine.stage_core_proc import (
     REQUEST_TYPE_ABORT,
     REQUEST_TYPE_GENERATE,
@@ -23,6 +36,7 @@ from vllm_omni.entrypoints.stage_engine.stage_core_proc import (
     RESPONSE_TYPE_ERROR,
     RESPONSE_TYPE_HEALTH,
     RESPONSE_TYPE_OUTPUT,
+    StageEngineCoreProc,
 )
 from vllm_omni.entrypoints.stage_engine.stage_serialization import (
     StageMsgpackDecoder,
@@ -31,36 +45,101 @@ from vllm_omni.entrypoints.stage_engine.stage_serialization import (
 from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
+if TYPE_CHECKING:
+    from vllm.v1.executor import Executor
+
 logger = init_logger(__name__)
 
+# Timeout for waiting for stage engine to be ready (seconds)
+STAGE_ENGINE_READY_TIMEOUT_S = 120
 
-class StageEngineCoreClient:
-    """ZMQ-based client for stage engine communication.
+
+class NonLLMStageClient(BaseStageClient):
+    """ZMQ-based client for non-LLM stage engine communication.
+
+    This client is used for Diffusion and Audio stages. For LLM stages,
+    use vLLM's EngineCoreClient.make_async_mp_client() directly.
 
     Communicates with StageEngineCoreProc via ZMQ:
     - ROUTER socket for sending requests to stage worker
     - PULL socket for receiving outputs from stage worker
 
+    This follows the same pattern as vLLM's AsyncMPClient.
+
     Attributes:
         stage_id: Unique identifier for this stage
+        stage_type: Type of stage ("diffusion", "audio")
         input_address: ZMQ address for sending requests (ROUTER)
         output_address: ZMQ address for receiving outputs (PULL)
     """
 
+    @staticmethod
+    def make_client(
+        stage_id: int,
+        stage_type: str,
+        vllm_config: VllmConfig | None = None,
+        executor_class: type["Executor"] | None = None,
+        input_address: str | None = None,
+        output_address: str | None = None,
+        log_stats: bool = False,
+    ) -> "NonLLMStageClient":
+        """Create a NonLLMStageClient and start the background stage process.
+
+        This is similar to EngineCoreClient.make_async_mp_client().
+
+        Args:
+            stage_id: Unique identifier for this stage
+            stage_type: Type of stage ("diffusion", "audio")
+            vllm_config: Config for the stage (passed to stage process)
+            executor_class: Executor class for the stage process
+            input_address: ZMQ address for sending requests (auto-generated if None)
+            output_address: ZMQ address for receiving outputs (auto-generated if None)
+            log_stats: Whether to log statistics
+
+        Returns:
+            Initialized NonLLMStageClient with background process running
+        """
+        # Generate addresses if not provided
+        if input_address is None:
+            input_address = f"tcp://127.0.0.1:{5555 + stage_id * 2}"
+        if output_address is None:
+            output_address = f"tcp://127.0.0.1:{5556 + stage_id * 2}"
+
+        # Create client
+        client = NonLLMStageClient(
+            stage_id=stage_id,
+            stage_type=stage_type,
+            input_address=input_address,
+            output_address=output_address,
+        )
+
+        # Start background stage process
+        client._start_stage_process(
+            vllm_config=vllm_config,
+            executor_class=executor_class,
+            log_stats=log_stats,
+        )
+
+        return client
+
     def __init__(
         self,
         stage_id: int,
+        stage_type: str,
         input_address: str,
         output_address: str,
     ):
         """Initialize the stage engine client.
 
+        Note: Use make_client() to create a client with a background process.
+
         Args:
             stage_id: Unique identifier for this stage
+            stage_type: Type of stage ("diffusion", "audio")
             input_address: ZMQ address for sending requests
             output_address: ZMQ address for receiving outputs
         """
-        self.stage_id = stage_id
+        super().__init__(stage_id, stage_type)
         self.input_address = input_address
         self.output_address = output_address
 
@@ -74,7 +153,9 @@ class StageEngineCoreClient:
         self.decoder = StageMsgpackDecoder()
 
         # Output queue for async iteration
-        self.outputs_queue: asyncio.Queue[OmniRequestOutput | Exception] = asyncio.Queue()
+        self.outputs_queue: asyncio.Queue[OmniRequestOutput | Exception] = (
+            asyncio.Queue()
+        )
 
         # Output processing task
         self.output_task: asyncio.Task | None = None
@@ -85,20 +166,106 @@ class StageEngineCoreClient:
         # Engine health
         self.engine_dead = False
 
-    async def start(self):
-        """Start the client and connect to stage worker."""
+        # Background process
+        self._stage_process: multiprocessing.Process | None = None
+
+        # Finalizer for cleanup
+        self._finalizer = weakref.finalize(self, self._cleanup)
+
+    def _start_stage_process(
+        self,
+        vllm_config: VllmConfig | None,
+        executor_class: type["Executor"] | None,
+        log_stats: bool,
+    ) -> None:
+        """Start the background stage process.
+
+        Args:
+            vllm_config: Config for the stage
+            executor_class: Executor class for the stage process
+            log_stats: Whether to log statistics
+        """
+        # Create and start the stage process
+        self._stage_process = multiprocessing.Process(
+            target=StageEngineCoreProc.run_stage_worker,
+            args=(
+                self.stage_id,
+                self.stage_type,
+                self.input_address,
+                self.output_address,
+                vllm_config,
+                executor_class,
+                log_stats,
+            ),
+            name=f"StageEngine-{self.stage_id}",
+            daemon=True,
+        )
+        self._stage_process.start()
+        logger.info(
+            f"Started stage {self.stage_id} ({self.stage_type}) process "
+            f"with PID {self._stage_process.pid}"
+        )
+
+        # Create ZMQ sockets
+        self._create_sockets()
+
+        # Wait for stage to be ready
+        self._wait_for_ready()
+
+        # Start output processing task
+        try:
+            asyncio.get_running_loop()
+            self._ensure_output_task()
+        except RuntimeError:
+            pass
+
+    def _create_sockets(self) -> None:
+        """Create ZMQ sockets for communication."""
         # Create ROUTER socket for sending requests
         self.input_socket = self.ctx.socket(zmq.ROUTER)
         self.input_socket.bind(self.input_address)
-        logger.info(f"Stage {self.stage_id} client bound to input: {self.input_address}")
+        logger.info(
+            f"Stage {self.stage_id} client bound to input: {self.input_address}"
+        )
 
         # Create PULL socket for receiving outputs
         self.output_socket = self.ctx.socket(zmq.PULL)
         self.output_socket.bind(self.output_address)
-        logger.info(f"Stage {self.stage_id} client bound to output: {self.output_address}")
+        logger.info(
+            f"Stage {self.stage_id} client bound to output: {self.output_address}"
+        )
 
-        # Start output processing task
-        self._ensure_output_task()
+    def _wait_for_ready(self) -> None:
+        """Wait for the stage process to be ready."""
+        # Use a sync socket to wait for the ready message
+        sync_input_socket = zmq.Socket.shadow(self.input_socket)
+
+        if not sync_input_socket.poll(timeout=STAGE_ENGINE_READY_TIMEOUT_S * 1000):
+            raise TimeoutError(
+                f"Timed out waiting for stage {self.stage_id} to send ready message"
+            )
+
+        # Receive the ready message
+        identity, _ = sync_input_socket.recv_multipart()
+        logger.info(f"Stage {self.stage_id} is ready (identity: {identity})")
+
+    def _cleanup(self) -> None:
+        """Cleanup resources (called by finalizer)."""
+        # Terminate stage process
+        if self._stage_process is not None and self._stage_process.is_alive():
+            self._stage_process.terminate()
+            self._stage_process.join(timeout=5)
+            if self._stage_process.is_alive():
+                self._stage_process.kill()
+
+        # Close sockets
+        if self.input_socket is not None:
+            self.input_socket.close()
+        if self.output_socket is not None:
+            self.output_socket.close()
+
+        # Terminate context
+        self.ctx.term()
 
     def _ensure_output_task(self):
         """Ensure output processing task is running."""
@@ -128,14 +295,22 @@ class StageEngineCoreClient:
                 if response_type == RESPONSE_TYPE_OUTPUT:
                     # Deserialize output
                     request_id = request_id_bytes.decode("utf-8")
-                    output = self.decoder.decode([bytes(f.buffer) for f in data_frames])
+                    output = self.decoder.decode(
+                        [bytes(f.buffer) for f in data_frames]
+                    )
                     await self.outputs_queue.put(output)
 
                 elif response_type == RESPONSE_TYPE_ERROR:
                     # Error response
                     request_id = request_id_bytes.decode("utf-8")
-                    error_msg = data_frames[0].decode("utf-8") if data_frames else "Unknown error"
-                    logger.error(f"Stage {self.stage_id} error for {request_id}: {error_msg}")
+                    error_msg = (
+                        data_frames[0].bytes.decode("utf-8")
+                        if data_frames
+                        else "Unknown error"
+                    )
+                    logger.error(
+                        f"Stage {self.stage_id} error for {request_id}: {error_msg}"
+                    )
                     await self.outputs_queue.put(
                         Exception(f"Stage {self.stage_id} error: {error_msg}")
                     )
@@ -163,19 +338,23 @@ class StageEngineCoreClient:
             logger.exception(f"Error in stage {self.stage_id} output processing")
             await self.outputs_queue.put(e)
 
-    async def submit_request(
-        self,
-        request_id: str,
-        prompt: OmniPromptType,
-        sampling_params: OmniSamplingParams,
-    ) -> None:
-        """Submit a generate request to the stage worker.
+    # ========== StageClient Protocol Methods ==========
+
+    async def add_request_async(self, request: dict[str, Any]) -> None:
+        """Submit a request to the stage worker.
+
+        This method implements the StageClient protocol.
 
         Args:
-            request_id: Unique request identifier
-            prompt: OmniPromptType (text, tokens, or embeds)
-            sampling_params: OmniSamplingParams (SamplingParams or OmniDiffusionSamplingParams)
+            request: Dictionary containing:
+                - request_id: Unique request identifier
+                - prompt: OmniPromptType (text, tokens, or embeds)
+                - sampling_params: OmniSamplingParams
         """
+        request_id = request["request_id"]
+        prompt = request["prompt"]
+        sampling_params = request["sampling_params"]
+
         if self.engine_dead:
             raise RuntimeError(f"Stage {self.stage_id} engine is dead")
 
@@ -193,8 +372,6 @@ class StageEngineCoreClient:
         bufs = self.encoder.encode(request_data)
 
         # Send multipart message: [identity, type, data_frames...]
-        # For ROUTER socket, we need to include the worker identity
-        # Since we only have one worker per stage, we can use a fixed identity
         worker_identity = f"stage_{self.stage_id}_worker".encode("utf-8")
         frames = [worker_identity, REQUEST_TYPE_GENERATE] + bufs
 
@@ -218,49 +395,66 @@ class StageEngineCoreClient:
 
         return output
 
-    async def get_outputs_async(self) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Get outputs from the stage worker as an async generator.
+    async def abort_requests_async(self, request_ids: list[str]) -> None:
+        """Abort one or more requests in the stage worker.
 
-        Yields:
-            OmniRequestOutput instances from the stage
-        """
-        while True:
-            try:
-                output = await self.get_output_async()
-                yield output
-
-                # If output is finished, remove from active requests
-                if output.finished:
-                    self.active_requests.discard(output.request_id)
-
-            except Exception as e:
-                logger.exception(f"Error getting output from stage {self.stage_id}")
-                raise
-
-    async def abort_request(self, request_id: str) -> None:
-        """Abort a request in the stage worker.
+        This method implements the StageClient protocol.
 
         Args:
-            request_id: Request ID to abort
+            request_ids: List of request IDs to abort
         """
         if self.engine_dead:
             return
 
-        # Prepare abort request
-        request_data = {"request_id": request_id}
+        for request_id in request_ids:
+            # Prepare abort request
+            request_data = {"request_id": request_id}
 
-        # Serialize request
-        bufs = self.encoder.encode(request_data)
+            # Serialize request
+            bufs = self.encoder.encode(request_data)
 
-        # Send multipart message
-        worker_identity = f"stage_{self.stage_id}_worker".encode("utf-8")
-        frames = [worker_identity, REQUEST_TYPE_ABORT] + bufs
+            # Send multipart message
+            worker_identity = f"stage_{self.stage_id}_worker".encode("utf-8")
+            frames = [worker_identity, REQUEST_TYPE_ABORT] + bufs
 
-        await self.input_socket.send_multipart(frames)
-        logger.debug(f"Aborted request {request_id} in stage {self.stage_id}")
+            await self.input_socket.send_multipart(frames)
+            logger.debug(f"Aborted request {request_id} in stage {self.stage_id}")
 
-        # Remove from active requests
-        self.active_requests.discard(request_id)
+            # Remove from active requests
+            self.active_requests.discard(request_id)
+
+    # ========== Legacy Methods (for backward compatibility) ==========
+
+    async def submit_request(
+        self,
+        request_id: str,
+        prompt: OmniPromptType,
+        sampling_params: OmniSamplingParams,
+    ) -> None:
+        """Submit a generate request to the stage worker.
+
+        This is a convenience method that wraps add_request_async.
+
+        Args:
+            request_id: Unique request identifier
+            prompt: OmniPromptType (text, tokens, or embeds)
+            sampling_params: OmniSamplingParams
+        """
+        await self.add_request_async({
+            "request_id": request_id,
+            "prompt": prompt,
+            "sampling_params": sampling_params,
+        })
+
+    async def abort_request(self, request_id: str) -> None:
+        """Abort a single request in the stage worker.
+
+        This is a convenience method that wraps abort_requests_async.
+
+        Args:
+            request_id: Request ID to abort
+        """
+        await self.abort_requests_async([request_id])
 
     async def check_health(self) -> bool:
         """Check if the stage worker is healthy.
@@ -269,6 +463,11 @@ class StageEngineCoreClient:
             True if healthy, False otherwise
         """
         if self.engine_dead:
+            return False
+
+        # Check if process is alive
+        if self._stage_process is not None and not self._stage_process.is_alive():
+            self.engine_dead = True
             return False
 
         try:
@@ -294,37 +493,32 @@ class StageEngineCoreClient:
     async def _wait_for_health_response(self):
         """Wait for health check response."""
         # This is a simplified implementation
-        # In production, we'd need to handle this more carefully
         await asyncio.sleep(0.1)
 
-    async def shutdown(self):
+    def shutdown(self) -> None:
         """Shutdown the stage worker and client."""
         logger.info(f"Shutting down stage {self.stage_id} client")
 
-        # Send shutdown request
+        # Send shutdown request (sync version for shutdown)
         if not self.engine_dead and self.input_socket is not None:
             try:
                 worker_identity = f"stage_{self.stage_id}_worker".encode("utf-8")
                 frames = [worker_identity, REQUEST_TYPE_SHUTDOWN]
-                await self.input_socket.send_multipart(frames)
+                # Use sync send for shutdown
+                sync_socket = zmq.Socket.shadow(self.input_socket)
+                sync_socket.send_multipart(frames)
             except Exception as e:
                 logger.exception(f"Error sending shutdown to stage {self.stage_id}")
 
         # Cancel output task
         if self.output_task is not None and not self.output_task.done():
             self.output_task.cancel()
-            try:
-                await self.output_task
-            except asyncio.CancelledError:
-                pass
 
-        # Close sockets
-        if self.input_socket is not None:
-            self.input_socket.close()
-        if self.output_socket is not None:
-            self.output_socket.close()
-
-        # Terminate context
-        self.ctx.term()
+        # Trigger finalizer for cleanup
+        self._finalizer()
 
         logger.info(f"Stage {self.stage_id} client shutdown complete")
+
+
+# Backward compatibility alias
+StageEngineCoreClient = NonLLMStageClient
