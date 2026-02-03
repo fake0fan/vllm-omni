@@ -749,12 +749,21 @@ def _stage_worker(
     # Prepare device environment context for engine creation
     # In in-process mode, we temporarily set CUDA_VISIBLE_DEVICES before creating the engine
     # so that EngineCoreProc subprocess inherits the correct device visibility
+    # We use a global lock to prevent race conditions when multiple stages start concurrently
     _saved_device_env = None
     _device_env_var = None
+    _engine_create_lock_fd = None
     if omni_stage_devices is not None:
         try:
             from vllm_omni.platforms import current_omni_platform
             _device_env_var = current_omni_platform.device_control_env_var
+
+            # Acquire global lock for engine creation to prevent env var race conditions
+            _engine_create_lock_path = "/tmp/vllm_omni_engine_create.lock"
+            _engine_create_lock_fd = _os.open(_engine_create_lock_path, _os.O_CREAT | _os.O_RDWR)
+            fcntl.flock(_engine_create_lock_fd, fcntl.LOCK_EX)
+            logger.debug("[Stage-%s] Acquired engine creation lock", stage_id)
+
             _saved_device_env = _os.environ.get(_device_env_var)
             _os.environ[_device_env_var] = str(omni_stage_devices)
             logger.info(
@@ -765,6 +774,14 @@ def _stage_worker(
             )
         except Exception as e:
             logger.warning("[Stage-%s] Failed to set device env for subprocess: %s", stage_id, e)
+            # Release lock on failure
+            if _engine_create_lock_fd is not None:
+                try:
+                    fcntl.flock(_engine_create_lock_fd, fcntl.LOCK_UN)
+                    _os.close(_engine_create_lock_fd)
+                except (OSError, ValueError):
+                    pass
+                _engine_create_lock_fd = None
 
     # Init engine based on stage_type
     logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
@@ -803,6 +820,15 @@ def _stage_worker(
                 _device_env_var,
                 _saved_device_env,
             )
+
+        # Release engine creation lock
+        if _engine_create_lock_fd is not None:
+            try:
+                fcntl.flock(_engine_create_lock_fd, fcntl.LOCK_UN)
+                _os.close(_engine_create_lock_fd)
+                logger.debug("[Stage-%s] Released engine creation lock", stage_id)
+            except (OSError, ValueError):
+                pass
 
         # Release all locks by closing file descriptors
         # Locks are automatically released when file descriptors are closed
@@ -1339,12 +1365,21 @@ async def _stage_worker_async(
     # Prepare device environment context for engine creation
     # In in-process mode, we temporarily set CUDA_VISIBLE_DEVICES before creating the engine
     # so that EngineCoreProc subprocess inherits the correct device visibility
+    # We use a global lock to prevent race conditions when multiple stages start concurrently
     _saved_device_env = None
     _device_env_var = None
+    _engine_create_lock_fd = None
     if omni_stage_devices is not None:
         try:
             from vllm_omni.platforms import current_omni_platform
             _device_env_var = current_omni_platform.device_control_env_var
+
+            # Acquire global lock for engine creation to prevent env var race conditions
+            _engine_create_lock_path = "/tmp/vllm_omni_engine_create.lock"
+            _engine_create_lock_fd = _os.open(_engine_create_lock_path, _os.O_CREAT | _os.O_RDWR)
+            fcntl.flock(_engine_create_lock_fd, fcntl.LOCK_EX)
+            logger.debug("[Stage-%s] Acquired engine creation lock", stage_id)
+
             _saved_device_env = _os.environ.get(_device_env_var)
             _os.environ[_device_env_var] = str(omni_stage_devices)
             logger.info(
@@ -1355,6 +1390,14 @@ async def _stage_worker_async(
             )
         except Exception as e:
             logger.warning("[Stage-%s] Failed to set device env for subprocess: %s", stage_id, e)
+            # Release lock on failure
+            if _engine_create_lock_fd is not None:
+                try:
+                    fcntl.flock(_engine_create_lock_fd, fcntl.LOCK_UN)
+                    _os.close(_engine_create_lock_fd)
+                except (OSError, ValueError):
+                    pass
+                _engine_create_lock_fd = None
 
     # Init engine based on stage_type
     logger.debug(
@@ -1412,6 +1455,15 @@ async def _stage_worker_async(
                 _device_env_var,
                 _saved_device_env,
             )
+
+        # Release engine creation lock
+        if _engine_create_lock_fd is not None:
+            try:
+                fcntl.flock(_engine_create_lock_fd, fcntl.LOCK_UN)
+                _os.close(_engine_create_lock_fd)
+                logger.debug("[Stage-%s] Released engine creation lock", stage_id)
+            except (OSError, ValueError):
+                pass
 
         # Release all locks by closing file descriptors
         # Locks are automatically released when file descriptors are closed
