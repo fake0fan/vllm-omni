@@ -1,6 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Input processors for vLLM-Omni multi-stage pipelines.
+
+This module provides:
+- OmniInputProcessor: Full-featured processor for LLM stages (extends vLLM's InputProcessor)
+- NonLLMInputProcessor: Lightweight processor for Diffusion/Audio stages
+
+For LLM stages, use OmniInputProcessor which handles tokenization and multimodal inputs.
+For non-LLM stages, use NonLLMInputProcessor which doesn't require VllmConfig.
+"""
+
+from __future__ import annotations
+
 import time
 from collections.abc import Mapping
-from typing import Any, cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.config import VllmConfig
@@ -17,16 +32,207 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine.input_processor import InputProcessor
 
-from vllm_omni.engine import (
+from vllm_omni.engine.types import (
     AdditionalInformationEntry,
     AdditionalInformationPayload,
     OmniEngineCoreRequest,
     PromptEmbedsPayload,
 )
+from vllm_omni.inputs.data import (
+    OmniDiffusionSamplingParams,
+    OmniPromptType,
+    OmniSamplingParams,
+)
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.lora.request import LoRARequest
 
+if TYPE_CHECKING:
+    pass
+
 logger = init_logger(__name__)
+
+
+# =============================================================================
+# NonLLMInputProcessor - For Diffusion/Audio Stages
+# =============================================================================
+
+
+@dataclass
+class NonLLMEngineCoreRequest:
+    """Simplified engine core request for non-LLM stages.
+
+    Unlike vLLM's EngineCoreRequest which is designed for LLM inference,
+    this class handles inputs for Diffusion/Audio stages that work with
+    embeddings and tensors rather than token IDs.
+
+    Attributes:
+        request_id: Unique identifier for this request
+        prompt: The input prompt (text, embeddings, or tensor)
+        sampling_params: Sampling parameters for generation
+        arrival_time: Request arrival timestamp
+        lora_request: Optional LoRA adapter request
+        priority: Request priority (higher = more urgent)
+        embeddings: Optional pre-computed embeddings
+        negative_embeddings: Optional negative embeddings for CFG
+        additional_data: Optional additional data for the stage
+    """
+
+    request_id: str
+    prompt: OmniPromptType | None = None
+    sampling_params: OmniSamplingParams | None = None
+    arrival_time: float = field(default_factory=time.time)
+    lora_request: LoRARequest | None = None
+    priority: int = 0
+
+    # Non-LLM stage specific fields
+    embeddings: torch.Tensor | None = None
+    negative_embeddings: torch.Tensor | None = None
+    additional_data: dict[str, Any] = field(default_factory=dict)
+
+
+class NonLLMInputProcessor:
+    """Lightweight input processor for non-LLM stages (Diffusion/Audio).
+
+    This processor handles inputs that don't require tokenization:
+    - Embeddings from previous LLM stages
+    - Raw tensor inputs
+    - Text prompts (passed through without tokenization)
+
+    Unlike vLLM's InputProcessor, this doesn't require VllmConfig and
+    doesn't perform tokenization or multimodal preprocessing.
+
+    Attributes:
+        stage_type: Type of stage ("diffusion", "audio")
+        config: Optional stage-specific configuration
+    """
+
+    def __init__(
+        self,
+        stage_type: str,
+        config: Any | None = None,
+    ) -> None:
+        """Initialize the input processor.
+
+        Args:
+            stage_type: Type of stage ("diffusion", "audio")
+            config: Optional stage-specific configuration
+        """
+        self.stage_type = stage_type
+        self.config = config
+        # Non-LLM stages don't have a tokenizer
+        self.tokenizer = None
+
+    def process_inputs(
+        self,
+        request_id: str,
+        prompt: OmniPromptType,
+        params: OmniSamplingParams,
+        arrival_time: float | None = None,
+        lora_request: LoRARequest | None = None,
+        priority: int = 0,
+        **kwargs,
+    ) -> NonLLMEngineCoreRequest:
+        """Process inputs for non-LLM stages.
+
+        Validates and normalizes inputs without tokenization.
+
+        Args:
+            request_id: Unique request identifier
+            prompt: Input prompt (text, embeddings, or tensor)
+            params: Sampling parameters
+            arrival_time: Request arrival timestamp
+            lora_request: Optional LoRA adapter request
+            priority: Request priority
+
+        Returns:
+            NonLLMEngineCoreRequest ready for stage processing
+        """
+        if arrival_time is None:
+            arrival_time = time.time()
+
+        # Validate params type for stage
+        self._validate_params(params)
+
+        # Extract embeddings if present in prompt
+        embeddings = None
+        negative_embeddings = None
+        additional_data = {}
+
+        if isinstance(prompt, dict):
+            embeddings = prompt.get("prompt_embeds")
+            negative_embeddings = prompt.get("negative_prompt_embeds")
+            additional_data = prompt.get("additional_information", {})
+
+        return NonLLMEngineCoreRequest(
+            request_id=request_id,
+            prompt=prompt,
+            sampling_params=params,
+            arrival_time=arrival_time,
+            lora_request=lora_request,
+            priority=priority,
+            embeddings=embeddings,
+            negative_embeddings=negative_embeddings,
+            additional_data=additional_data,
+        )
+
+    def _validate_params(self, params: OmniSamplingParams) -> None:
+        """Validate sampling parameters for the stage type.
+
+        Args:
+            params: Sampling parameters to validate
+
+        Raises:
+            ValueError: If params are invalid for the stage type
+        """
+        if self.stage_type == "diffusion":
+            if not isinstance(params, (OmniDiffusionSamplingParams, SamplingParams)):
+                logger.warning(
+                    "Diffusion stage received unexpected params type: %s",
+                    type(params).__name__,
+                )
+        elif self.stage_type == "audio":
+            # Audio stage validation (to be implemented)
+            pass
+
+
+# =============================================================================
+# Factory Function
+# =============================================================================
+
+
+def create_input_processor(
+    stage_type: str,
+    vllm_config: VllmConfig | None = None,
+    tokenizer: TokenizerLike | None = None,
+    config: Any | None = None,
+) -> "OmniInputProcessor | NonLLMInputProcessor":
+    """Create an appropriate input processor for the stage type.
+
+    Args:
+        stage_type: Type of stage ("llm", "diffusion", "audio")
+        vllm_config: vLLM configuration (required for LLM stages)
+        tokenizer: Tokenizer (required for LLM stages)
+        config: Stage-specific configuration (for non-LLM stages)
+
+    Returns:
+        Input processor appropriate for the stage type
+
+    Raises:
+        ValueError: If vllm_config/tokenizer is missing for LLM stage
+    """
+    if stage_type == "llm":
+        if vllm_config is None:
+            raise ValueError("vllm_config is required for LLM stage input processor")
+        if tokenizer is None:
+            raise ValueError("tokenizer is required for LLM stage input processor")
+        return OmniInputProcessor(vllm_config, tokenizer)
+    else:
+        return NonLLMInputProcessor(stage_type, config)
+
+
+# =============================================================================
+# OmniInputProcessor - For LLM Stages
+# =============================================================================
 
 
 class OmniInputProcessor(InputProcessor):

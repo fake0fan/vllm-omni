@@ -1,4 +1,17 @@
-from ast import Dict
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Output processors for vLLM-Omni multi-stage pipelines.
+
+This module provides:
+- OmniRequestState: Request state with multimodal output accumulation
+- MultimodalOutputProcessor: Handles multimodal outputs (image, audio, latents)
+
+The output processor routes EngineCoreOutput by modality type and accumulates
+multimodal tensors across streaming chunks.
+"""
+
+from __future__ import annotations
+
 from collections.abc import Callable
 from typing import Any
 
@@ -9,13 +22,27 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
-from vllm.v1.engine.output_processor import OutputProcessorOutput, RequestOutputCollector, RequestState
+from vllm.v1.engine.output_processor import (
+    OutputProcessorOutput,
+    RequestOutputCollector,
+    RequestState,
+)
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+# Supported modality types for routing
+MODALITY_IMAGE = ("image", "images", "pixel_values", "pixels")
+MODALITY_LATENT = ("latent", "latents", "z", "posterior")
+MODALITY_AUDIO = ("audio", "audios", "wav", "waveform", "audio_pcm", "pcm")
 
 
 class OmniRequestState(RequestState):

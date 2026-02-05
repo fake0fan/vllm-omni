@@ -200,6 +200,18 @@ class OmniStage:
         self.engine_outputs = engine_outputs
 
     # ----------------- New Orchestration APIs -----------------
+    # NOTE: The following queue-based methods (attach_queues, submit, try_collect)
+    # are used by the legacy mp.Queue architecture. When VLLM_OMNI_USE_NEW_ARCHITECTURE=1
+    # is set, these methods are bypassed in favor of ZMQ-based communication via
+    # StageEngineCoreClient/StageEngineCoreProc. The new architecture is implemented in:
+    # - vllm_omni/entrypoints/stage_engine/stage_core_client.py
+    # - vllm_omni/entrypoints/stage_engine/stage_core_proc.py
+    # - vllm_omni/entrypoints/pipeline_orchestrator.py
+    # - vllm_omni/entrypoints/multi_stage_engine_client.py
+    #
+    # The stage configuration and input processing logic (process_engine_inputs)
+    # remain shared between both architectures.
+
     def attach_queues(self, in_q: mp.Queue, out_q: mp.Queue) -> None:
         """Attach input and output queues for IPC communication.
 
