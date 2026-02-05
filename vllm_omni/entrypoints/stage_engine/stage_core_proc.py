@@ -5,6 +5,18 @@ AsyncOmniLLM or AsyncOmniDiffusion engines and handles request processing
 in a background process.
 
 Based on vLLM's EngineCoreProc pattern (vllm/v1/engine/core.py).
+
+Reuses vLLM's:
+- EngineHandshakeMetadata, EngineZmqAddresses for handshake
+- startup_handshake pattern from EngineCoreProc
+
+Startup flow (handshake):
+    1. Worker starts and connects to handshake_address
+    2. Worker sends HELLO message
+    3. Parent sends EngineHandshakeMetadata with ZMQ addresses
+    4. Worker connects to input/output addresses
+    5. Worker sends READY message
+    6. Worker enters main processing loop
 """
 
 import asyncio
@@ -15,9 +27,16 @@ import time
 from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any
 
+import msgspec
 import zmq
+
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.utils.network_utils import make_zmq_socket
+from vllm.v1.engine.utils import (
+    EngineHandshakeMetadata,
+    EngineZmqAddresses,
+)
 
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
@@ -25,6 +44,7 @@ from vllm_omni.entrypoints.stage_engine.stage_serialization import (
     StageMsgpackDecoder,
     StageMsgpackEncoder,
 )
+from vllm_omni.engine.input_processor import NonLLMInputProcessor
 from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -102,6 +122,11 @@ class StageEngineCoreProc:
         # Engine instance (initialized in run_stage_loop)
         self.engine: AsyncOmniLLM | AsyncOmniDiffusion | None = None
 
+        # Input processor for non-LLM stages (validates and normalizes inputs)
+        self.input_processor: NonLLMInputProcessor | None = None
+        if stage_type != "llm":
+            self.input_processor = NonLLMInputProcessor(stage_type, config=vllm_config)
+
         # Serialization
         self.encoder = StageMsgpackEncoder()
         self.decoder = StageMsgpackDecoder()
@@ -113,22 +138,28 @@ class StageEngineCoreProc:
     def run_stage_worker(
         stage_id: int,
         stage_type: str,
-        input_address: str,
-        output_address: str,
+        handshake_address: str,
         vllm_config: VllmConfig | None = None,
         executor_class: type["Executor"] | None = None,
         log_stats: bool = False,
     ):
         """Entry point for running stage worker in background process.
 
-        This is called by StageEngineCoreClient.make_client() to start the
-        background process. Similar to vLLM's EngineCoreProc.run_engine_core().
+        This is called by StageProcManager to start the background process.
+        Similar to vLLM's EngineCoreProc.run_engine_core().
+
+        The worker performs handshake to receive ZMQ addresses from parent:
+        1. Connect to handshake_address
+        2. Send HELLO message
+        3. Receive EngineHandshakeMetadata with input/output addresses
+        4. Connect to those addresses
+        5. Send READY message
+        6. Enter main processing loop
 
         Args:
             stage_id: Unique identifier for this stage
             stage_type: Type of stage ("llm", "diffusion", "audio")
-            input_address: ZMQ address for receiving requests (DEALER connects here)
-            output_address: ZMQ address for sending outputs (PUSH connects here)
+            handshake_address: ZMQ address for handshake with parent
             vllm_config: VllmConfig for LLM stages (None for non-LLM stages)
             executor_class: Executor class for the stage process
             log_stats: Whether to log statistics
@@ -148,6 +179,23 @@ class StageEngineCoreProc:
         proc = None
         try:
             logger.info(f"Starting stage {stage_id} worker process (type={stage_type})")
+
+            # Perform handshake to get ZMQ addresses (returns EngineZmqAddresses)
+            addresses = StageEngineCoreProc._do_handshake(
+                stage_id=stage_id,
+                stage_type=stage_type,
+                handshake_address=handshake_address,
+            )
+
+            # EngineZmqAddresses has inputs/outputs as lists
+            input_address = addresses.inputs[0]
+            output_address = addresses.outputs[0]
+
+            logger.info(
+                f"Stage {stage_id} received addresses: "
+                f"input={input_address}, output={output_address}"
+            )
+
             proc = StageEngineCoreProc(
                 stage_id=stage_id,
                 stage_type=stage_type,
@@ -157,7 +205,7 @@ class StageEngineCoreProc:
                 executor_class=executor_class,
                 log_stats=log_stats,
             )
-            proc.run_stage_loop()
+            proc.run_stage_loop(handshake_address)
         except SystemExit:
             logger.info(f"Stage {stage_id} worker exiting gracefully")
             raise
@@ -170,14 +218,68 @@ class StageEngineCoreProc:
             if proc is not None:
                 proc.shutdown()
 
-    def run_stage_loop(self):
+    @staticmethod
+    def _do_handshake(
+        stage_id: int,
+        stage_type: str,
+        handshake_address: str,
+    ) -> EngineZmqAddresses:
+        """Perform handshake with parent to receive ZMQ addresses.
+
+        Reuses vLLM's EngineHandshakeMetadata for the init message.
+
+        Args:
+            stage_id: Stage identifier
+            stage_type: Type of stage
+            handshake_address: ZMQ address for handshake
+
+        Returns:
+            EngineZmqAddresses with input/output addresses
+        """
+        identity = stage_id.to_bytes(2, "little")
+
+        ctx = zmq.Context()
+        with make_zmq_socket(
+            ctx,
+            handshake_address,
+            zmq.DEALER,
+            identity=identity,
+            bind=False,
+        ) as socket:
+            # Send HELLO message (same format as vLLM's EngineCoreProc)
+            hello_msg = msgspec.msgpack.encode({
+                "status": "HELLO",
+                "local": True,
+                "headless": False,
+            })
+            socket.send(hello_msg)
+            logger.debug(f"Stage {stage_id} sent HELLO")
+
+            # Receive init message with addresses (vLLM's EngineHandshakeMetadata)
+            init_msg_bytes = socket.recv()
+            metadata: EngineHandshakeMetadata = msgspec.msgpack.decode(
+                init_msg_bytes,
+                type=EngineHandshakeMetadata,
+            )
+            logger.debug(f"Stage {stage_id} received handshake metadata")
+
+            return metadata.addresses
+
+    def run_stage_loop(self, handshake_address: str | None = None):
         """Main loop for stage worker process.
 
-        Initializes the engine, starts IO threads, and processes requests.
+        Initializes the engine, sends READY, starts IO threads, and processes requests.
+
+        Args:
+            handshake_address: If provided, send READY message after init
         """
         # Initialize the engine
         logger.info(f"Initializing stage {self.stage_id} engine")
         self._init_engine()
+
+        # Send READY message if handshake address provided
+        if handshake_address:
+            self._send_ready(handshake_address)
 
         # Start IO threads
         with ExitStack() as stack:
@@ -200,6 +302,33 @@ class StageEngineCoreProc:
             # Main processing loop
             logger.info(f"Stage {self.stage_id} entering main loop")
             asyncio.run(self._async_main_loop())
+
+    def _send_ready(self, handshake_address: str):
+        """Send READY message to parent after engine initialization.
+
+        Uses same format as vLLM's EngineCoreProc ready message.
+
+        Args:
+            handshake_address: ZMQ address for handshake
+        """
+        identity = self.stage_id.to_bytes(2, "little")
+
+        ctx = zmq.Context()
+        with make_zmq_socket(
+            ctx,
+            handshake_address,
+            zmq.DEALER,
+            identity=identity,
+            bind=False,
+        ) as socket:
+            ready_msg = msgspec.msgpack.encode({
+                "status": "READY",
+                "local": True,
+                "headless": False,
+                "num_gpu_blocks": 0,  # Non-LLM stages don't have KV cache
+            })
+            socket.send(ready_msg)
+            logger.debug(f"Stage {self.stage_id} sent READY")
 
     def _init_engine(self):
         """Initialize the stage engine (AsyncOmniLLM or AsyncOmniDiffusion).
@@ -272,6 +401,17 @@ class StageEngineCoreProc:
         sampling_params = request_data["sampling_params"]
 
         try:
+            # For non-LLM stages, use input processor to validate and normalize
+            if self.input_processor is not None:
+                processed = self.input_processor.process_inputs(
+                    request_id=request_id,
+                    prompt=prompt,
+                    params=sampling_params,
+                )
+                # Use processed values (may extract embeddings, etc.)
+                prompt = processed.prompt
+                sampling_params = processed.sampling_params
+
             # Generate outputs
             async for output in self.engine.generate(
                 prompt=prompt,
@@ -344,9 +484,6 @@ class StageEngineCoreProc:
         with ctx.socket(zmq.DEALER) as socket:
             socket.connect(self.input_address)
             logger.info(f"Stage {self.stage_id} connected to input socket: {self.input_address}")
-
-            # Send initial empty message to establish connection
-            socket.send(b"")
 
             while not self.shutdown_requested:
                 try:

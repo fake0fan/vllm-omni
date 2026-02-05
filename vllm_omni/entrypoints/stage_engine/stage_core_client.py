@@ -9,12 +9,16 @@ For LLM stages, use vLLM's EngineCoreClient.make_async_mp_client() directly.
 For non-LLM stages (Diffusion, Audio), use NonLLMStageClient.
 
 Based on vLLM's AsyncMPClient pattern (vllm/v1/engine/core_client.py).
+
+Note:
+    Stage worker processes are started by launch_stage_engines() in
+    stage_launcher.py, NOT by this client. This client only connects
+    to already-running workers via ZMQ addresses received from handshake.
 """
 
 from __future__ import annotations
 
 import asyncio
-import multiprocessing
 import weakref
 from typing import TYPE_CHECKING, Any
 
@@ -36,7 +40,6 @@ from vllm_omni.entrypoints.stage_engine.stage_core_proc import (
     RESPONSE_TYPE_ERROR,
     RESPONSE_TYPE_HEALTH,
     RESPONSE_TYPE_OUTPUT,
-    StageEngineCoreProc,
 )
 from vllm_omni.entrypoints.stage_engine.stage_serialization import (
     StageMsgpackDecoder,
@@ -49,9 +52,6 @@ if TYPE_CHECKING:
     from vllm.v1.executor import Executor
 
 logger = init_logger(__name__)
-
-# Timeout for waiting for stage engine to be ready (seconds)
-STAGE_ENGINE_READY_TIMEOUT_S = 120
 
 
 class NonLLMStageClient(BaseStageClient):
@@ -66,6 +66,11 @@ class NonLLMStageClient(BaseStageClient):
 
     This follows the same pattern as vLLM's AsyncMPClient.
 
+    Note:
+        Stage worker processes are started by launch_stage_engines(),
+        NOT by this client. This client only connects to already-running
+        workers via ZMQ addresses.
+
     Attributes:
         stage_id: Unique identifier for this stage
         stage_type: Type of stage ("diffusion", "audio")
@@ -77,34 +82,30 @@ class NonLLMStageClient(BaseStageClient):
     def make_client(
         stage_id: int,
         stage_type: str,
+        input_address: str,
+        output_address: str,
         vllm_config: VllmConfig | None = None,
         executor_class: type["Executor"] | None = None,
-        input_address: str | None = None,
-        output_address: str | None = None,
         log_stats: bool = False,
     ) -> "NonLLMStageClient":
-        """Create a NonLLMStageClient and start the background stage process.
+        """Create a NonLLMStageClient that connects to an existing stage worker.
 
-        This is similar to EngineCoreClient.make_async_mp_client().
+        Note: This does NOT start a stage worker process. Workers are started
+        by launch_stage_engines() in stage_launcher.py. This method only
+        creates a client that connects to an already-running worker.
 
         Args:
             stage_id: Unique identifier for this stage
             stage_type: Type of stage ("diffusion", "audio")
-            vllm_config: Config for the stage (passed to stage process)
-            executor_class: Executor class for the stage process
-            input_address: ZMQ address for sending requests (auto-generated if None)
-            output_address: ZMQ address for receiving outputs (auto-generated if None)
-            log_stats: Whether to log statistics
+            input_address: ZMQ address for sending requests (from handshake)
+            output_address: ZMQ address for receiving outputs (from handshake)
+            vllm_config: Config for the stage (unused, kept for API compatibility)
+            executor_class: Executor class (unused, kept for API compatibility)
+            log_stats: Whether to log statistics (unused, kept for API compatibility)
 
         Returns:
-            Initialized NonLLMStageClient with background process running
+            Initialized NonLLMStageClient connected to the worker
         """
-        # Generate addresses if not provided
-        if input_address is None:
-            input_address = f"tcp://127.0.0.1:{5555 + stage_id * 2}"
-        if output_address is None:
-            output_address = f"tcp://127.0.0.1:{5556 + stage_id * 2}"
-
         # Create client
         client = NonLLMStageClient(
             stage_id=stage_id,
@@ -113,11 +114,10 @@ class NonLLMStageClient(BaseStageClient):
             output_address=output_address,
         )
 
-        # Start background stage process
-        client._start_stage_process(
-            vllm_config=vllm_config,
-            executor_class=executor_class,
-            log_stats=log_stats,
+        # Connect to existing worker (sockets created in __init__)
+        logger.info(
+            f"NonLLMStageClient for stage {stage_id} ({stage_type}) "
+            f"connected to input={input_address}, output={output_address}"
         )
 
         return client
@@ -131,7 +131,7 @@ class NonLLMStageClient(BaseStageClient):
     ):
         """Initialize the stage engine client.
 
-        Note: Use make_client() to create a client with a background process.
+        Note: Use make_client() to create a client.
 
         Args:
             stage_id: Unique identifier for this stage
@@ -145,8 +145,7 @@ class NonLLMStageClient(BaseStageClient):
 
         # ZMQ context and sockets
         self.ctx = zmq.asyncio.Context()
-        self.input_socket: zmq.asyncio.Socket | None = None
-        self.output_socket: zmq.asyncio.Socket | None = None
+        self._create_sockets()
 
         # Serialization
         self.encoder = StageMsgpackEncoder()
@@ -166,106 +165,40 @@ class NonLLMStageClient(BaseStageClient):
         # Engine health
         self.engine_dead = False
 
-        # Background process
-        self._stage_process: multiprocessing.Process | None = None
-
         # Finalizer for cleanup
         self._finalizer = weakref.finalize(self, self._cleanup)
 
-    def _start_stage_process(
-        self,
-        vllm_config: VllmConfig | None,
-        executor_class: type["Executor"] | None,
-        log_stats: bool,
-    ) -> None:
-        """Start the background stage process.
-
-        Args:
-            vllm_config: Config for the stage
-            executor_class: Executor class for the stage process
-            log_stats: Whether to log statistics
-        """
-        # Create and start the stage process
-        self._stage_process = multiprocessing.Process(
-            target=StageEngineCoreProc.run_stage_worker,
-            args=(
-                self.stage_id,
-                self.stage_type,
-                self.input_address,
-                self.output_address,
-                vllm_config,
-                executor_class,
-                log_stats,
-            ),
-            name=f"StageEngine-{self.stage_id}",
-            daemon=True,
-        )
-        self._stage_process.start()
-        logger.info(
-            f"Started stage {self.stage_id} ({self.stage_type}) process "
-            f"with PID {self._stage_process.pid}"
-        )
-
-        # Create ZMQ sockets
-        self._create_sockets()
-
-        # Wait for stage to be ready
-        self._wait_for_ready()
-
-        # Start output processing task
-        try:
-            asyncio.get_running_loop()
-            self._ensure_output_task()
-        except RuntimeError:
-            pass
-
     def _create_sockets(self) -> None:
-        """Create ZMQ sockets for communication."""
+        """Create ZMQ sockets for communication.
+
+        Note: We BIND on the client side (ROUTER/PULL) because the client
+        is the stable endpoint. Workers CONNECT to these addresses.
+        """
         # Create ROUTER socket for sending requests
         self.input_socket = self.ctx.socket(zmq.ROUTER)
         self.input_socket.bind(self.input_address)
-        logger.info(
+        logger.debug(
             f"Stage {self.stage_id} client bound to input: {self.input_address}"
         )
 
         # Create PULL socket for receiving outputs
         self.output_socket = self.ctx.socket(zmq.PULL)
         self.output_socket.bind(self.output_address)
-        logger.info(
+        logger.debug(
             f"Stage {self.stage_id} client bound to output: {self.output_address}"
         )
 
-    def _wait_for_ready(self) -> None:
-        """Wait for the stage process to be ready."""
-        # Use a sync socket to wait for the ready message
-        sync_input_socket = zmq.Socket.shadow(self.input_socket)
-
-        if not sync_input_socket.poll(timeout=STAGE_ENGINE_READY_TIMEOUT_S * 1000):
-            raise TimeoutError(
-                f"Timed out waiting for stage {self.stage_id} to send ready message"
-            )
-
-        # Receive the ready message
-        identity, _ = sync_input_socket.recv_multipart()
-        logger.info(f"Stage {self.stage_id} is ready (identity: {identity})")
-
     def _cleanup(self) -> None:
         """Cleanup resources (called by finalizer)."""
-        # Terminate stage process
-        if self._stage_process is not None and self._stage_process.is_alive():
-            self._stage_process.terminate()
-            self._stage_process.join(timeout=5)
-            if self._stage_process.is_alive():
-                self._stage_process.kill()
-
         # Close sockets
-        if self.input_socket is not None:
+        if hasattr(self, 'input_socket') and self.input_socket is not None:
             self.input_socket.close()
-        if self.output_socket is not None:
+        if hasattr(self, 'output_socket') and self.output_socket is not None:
             self.output_socket.close()
 
         # Terminate context
-        self.ctx.term()
+        if hasattr(self, 'ctx'):
+            self.ctx.term()
 
     def _ensure_output_task(self):
         """Ensure output processing task is running."""
@@ -372,7 +305,7 @@ class NonLLMStageClient(BaseStageClient):
         bufs = self.encoder.encode(request_data)
 
         # Send multipart message: [identity, type, data_frames...]
-        worker_identity = f"stage_{self.stage_id}_worker".encode("utf-8")
+        worker_identity = self.stage_id.to_bytes(2, "little")
         frames = [worker_identity, REQUEST_TYPE_GENERATE] + bufs
 
         await self.input_socket.send_multipart(frames)
@@ -414,7 +347,7 @@ class NonLLMStageClient(BaseStageClient):
             bufs = self.encoder.encode(request_data)
 
             # Send multipart message
-            worker_identity = f"stage_{self.stage_id}_worker".encode("utf-8")
+            worker_identity = self.stage_id.to_bytes(2, "little")
             frames = [worker_identity, REQUEST_TYPE_ABORT] + bufs
 
             await self.input_socket.send_multipart(frames)
@@ -465,14 +398,9 @@ class NonLLMStageClient(BaseStageClient):
         if self.engine_dead:
             return False
 
-        # Check if process is alive
-        if self._stage_process is not None and not self._stage_process.is_alive():
-            self.engine_dead = True
-            return False
-
         try:
             # Send health check request
-            worker_identity = f"stage_{self.stage_id}_worker".encode("utf-8")
+            worker_identity = self.stage_id.to_bytes(2, "little")
             frames = [worker_identity, REQUEST_TYPE_HEALTH_CHECK]
             await self.input_socket.send_multipart(frames)
 
@@ -496,13 +424,13 @@ class NonLLMStageClient(BaseStageClient):
         await asyncio.sleep(0.1)
 
     def shutdown(self) -> None:
-        """Shutdown the stage worker and client."""
+        """Shutdown the stage client."""
         logger.info(f"Shutting down stage {self.stage_id} client")
 
         # Send shutdown request (sync version for shutdown)
         if not self.engine_dead and self.input_socket is not None:
             try:
-                worker_identity = f"stage_{self.stage_id}_worker".encode("utf-8")
+                worker_identity = self.stage_id.to_bytes(2, "little")
                 frames = [worker_identity, REQUEST_TYPE_SHUTDOWN]
                 # Use sync send for shutdown
                 sync_socket = zmq.Socket.shadow(self.input_socket)

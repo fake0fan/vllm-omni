@@ -1,9 +1,11 @@
 from dataclasses import dataclass, field
 
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTextConfig
+from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
+from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncEngineArgs
 
 from vllm_omni.config import OmniModelConfig
@@ -164,6 +166,9 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
             Used to route outputs to appropriate processors (e.g., "image",
             "audio", "latents"). If None, output type is inferred.
         stage_connector_spec: Extra configuration for stage connector
+        worker_cls: Worker class to use for this stage. If not specified,
+            uses the default worker class from vLLM.
+        scheduler_cls: Scheduler class to use for this stage.
     """
 
     stage_id: int = 0
@@ -175,6 +180,9 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
     stage_connector_spec: dict[str, any] = field(default_factory=dict)
     async_chunk: bool = False
     omni_kv_config: dict | None = None
+    # Worker and scheduler class overrides for omni stages
+    worker_cls: str | None = None
+    scheduler_cls: str | None = None
 
     def draw_hf_text_config(self, config_dict: dict) -> Qwen3OmniMoeTextConfig:
         # transformers' get_text_config method is used to get the text config from thinker_config.
@@ -196,6 +204,9 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()
+        # If worker_cls is None, reset to "auto" so parent class uses default
+        if self.worker_cls is None:
+            self.worker_cls = "auto"
         super().__post_init__()
 
     def _ensure_omni_models_registered(self):
@@ -238,3 +249,33 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         omni_config.hf_config.architectures = omni_config.architectures
 
         return omni_config
+
+    def create_engine_config(
+        self,
+        usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
+    ) -> VllmConfig:
+        """Create engine config with worker_cls support.
+
+        Extends the parent class's create_engine_config to set worker_cls
+        in parallel_config, enabling custom worker classes for omni stages.
+
+        Args:
+            usage_context: Usage context for the engine
+
+        Returns:
+            VllmConfig with worker_cls set in parallel_config
+        """
+        # Get base config from parent
+        vllm_config = super().create_engine_config(usage_context=usage_context)
+
+        # Set worker_cls in parallel_config if explicitly specified (not "auto")
+        if self.worker_cls is not None and self.worker_cls != "auto":
+            vllm_config.parallel_config.worker_cls = self.worker_cls
+            logger.info("Set worker_cls to %s", self.worker_cls)
+
+        # Set scheduler_cls if specified
+        if self.scheduler_cls is not None:
+            vllm_config.scheduler_config.scheduler_cls = self.scheduler_cls
+            logger.info("Set scheduler_cls to %s", self.scheduler_cls)
+
+        return vllm_config
