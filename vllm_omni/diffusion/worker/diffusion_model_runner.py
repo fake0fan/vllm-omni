@@ -26,7 +26,8 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.offload import apply_offload_hooks
+from vllm_omni.diffusion.offloader import get_offload_backend
+from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
@@ -62,6 +63,7 @@ class DiffusionModelRunner:
         self.device = device
         self.pipeline = None
         self.cache_backend = None
+        self.offload_backend = None
 
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
@@ -69,6 +71,8 @@ class DiffusionModelRunner:
     def load_model(
         self,
         memory_pool_context_fn: callable | None = None,
+        load_format: str | None = None,
+        custom_pipeline_name: str | None = None,
     ) -> None:
         """
         Load the diffusion model, apply compilation and offloading.
@@ -76,7 +80,17 @@ class DiffusionModelRunner:
         Args:
             memory_pool_context_fn: Optional function that returns a context manager
                 for memory pool allocation (used for sleep mode).
+            load_format: Format for loading model weights. Supported formats:
+                - "default" (default): Automatically detect and use the default format based on configuration
+                - "custom_pipeline": Init model from a custom pipeline class specified by `custom_pipeline_name`
+                - "dummy": Skip actual weight loading, useful for testing and custom pipelines that
+                    don't require default weights.
+            custom_pipeline_name: Optional custom pipeline class name to use.
         """
+
+        if load_format == "dummy":
+            return
+
         load_device = (
             "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
         )
@@ -87,18 +101,19 @@ class DiffusionModelRunner:
             return nullcontext()
 
         # Load model within forward context
-        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-            load_config = LoadConfig()
-            model_loader = DiffusersPipelineLoader(load_config)
-            time_before_load = time.perf_counter()
+        load_config = LoadConfig()
+        model_loader = DiffusersPipelineLoader(load_config)
+        time_before_load = time.perf_counter()
 
-            with get_memory_context():
-                with DeviceMemoryProfiler() as m:
-                    self.pipeline = model_loader.load_model(
-                        od_config=self.od_config,
-                        load_device=load_device,
-                    )
-            time_after_load = time.perf_counter()
+        with get_memory_context():
+            with DeviceMemoryProfiler() as m:
+                self.pipeline = model_loader.load_model(
+                    od_config=self.od_config,
+                    load_device=load_device,
+                    load_format=load_format,
+                    custom_pipeline_name=custom_pipeline_name,
+                )
+        time_after_load = time.perf_counter()
 
         logger.info(
             "Model loading took %.4f GiB and %.6f seconds",
@@ -108,8 +123,10 @@ class DiffusionModelRunner:
         logger.info("Model runner: Model loaded successfully.")
 
         # Apply CPU offloading
-        if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload:
-            apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
+        self.offload_backend = get_offload_backend(self.od_config, device=self.device)
+        if self.offload_backend is not None:
+            logger.info(f" Enabling offloader backend: {self.offload_backend.__class__.__name__}")
+            self.offload_backend.enable(self.pipeline)
 
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
@@ -132,7 +149,16 @@ class DiffusionModelRunner:
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
 
         if self.cache_backend is not None:
-            self.cache_backend.enable(self.pipeline)
+            if self.od_config.model_class_name in _NO_CACHE_ACCELERATION:
+                logger.warning(
+                    "Cache backend '%s' is not supported for %s; disabling cache acceleration.",
+                    self.od_config.cache_backend,
+                    self.od_config.model_class_name,
+                )
+                self.cache_backend = None
+                self.od_config.cache_backend = None
+            else:
+                self.cache_backend.enable(self.pipeline)
 
         logger.info("Model runner: Initialization complete.")
 
@@ -140,7 +166,6 @@ class DiffusionModelRunner:
         """Load weights into the pipeline."""
         return self.pipeline.load_weights(weights)
 
-    @torch.inference_mode()
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -150,31 +175,52 @@ class DiffusionModelRunner:
 
         Returns:
             DiffusionOutput with generated results.
+
+        Note:
+            We use torch.no_grad() for HSDP because HSDP2's fully_shard requires access
+            to tensor version counters in pre_forward hooks, which inference tensors do
+            not track. For non-HSDP inference, we use torch.inference_mode() for better
+            performance.
         """
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if len(req.prompts) == 0:
             raise ValueError("Cannot execute model with empty request list")
 
-        # The manager handles the check for need_recv_cache internally
-        self.kv_transfer_manager.receive_kv_cache(req, target_device=getattr(self.pipeline, "device", None))
+        # Use no_grad() for HSDP compatibility, inference_mode() otherwise for better perf
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        with grad_context:
+            # The manager handles the check for need_recv_cache internally
+            self.kv_transfer_manager.receive_kv_cache(req, target_device=getattr(self.pipeline, "device", None))
 
-        if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-            req.sampling_params.generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+            if req.sampling_params.generator is None and req.sampling_params.seed is not None:
+                if req.sampling_params.generator_device is not None:
+                    gen_device = req.sampling_params.generator_device
+                elif self.device.type == "cpu":
+                    gen_device = "cpu"
+                else:
+                    gen_device = self.device
+                req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
 
-        # Refresh cache context if needed
-        if (
-            not getattr(req, "skip_cache_refresh", False)
-            and self.cache_backend is not None
-            and self.cache_backend.is_enabled()
-        ):
-            self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
+            # Refresh cache context if needed
+            if (
+                not getattr(req, "skip_cache_refresh", False)
+                and self.cache_backend is not None
+                and self.cache_backend.is_enabled()
+            ):
+                self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
 
-        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-            with record_function("pipeline_forward"):
-                output = self.pipeline.forward(req)
+            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                with record_function("pipeline_forward"):
+                    output = self.pipeline.forward(req)
 
             # NOTE:
-            if self.od_config.cache_backend == "cache_dit" and self.od_config.enable_cache_dit_summary:
+            if (
+                self.cache_backend is not None
+                and self.cache_backend.is_enabled()
+                and self.od_config.cache_backend == "cache_dit"
+                and self.od_config.enable_cache_dit_summary
+            ):
                 cache_summary(self.pipeline, details=True)
 
-        return output
+            return output
