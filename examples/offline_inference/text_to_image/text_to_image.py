@@ -9,13 +9,19 @@ from typing import Any
 
 import torch
 
+from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
-from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
-from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
+
+USE_V1 = (os.environ.get("vllm_omni_use_v1") or os.environ.get("VLLM_OMNI_USE_V1", "")).lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def is_nextstep_model(model_name: str) -> bool:
@@ -305,6 +311,8 @@ def main():
     if use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+    if USE_V1:
+        omni_kwargs["log_stats"] = False
     omni = Omni(**omni_kwargs)
 
     if profiler_enabled:
@@ -394,20 +402,22 @@ def main():
         else:
             print("[Profiler] No valid profiling data returned.")
 
-    # Extract images from OmniRequestOutput
-    # omni.generate() returns list[OmniRequestOutput], extract images from the first output
+    # omni.generate() returns list[OmniRequestOutput]
     if not outputs or len(outputs) == 0:
         raise ValueError("No output generated from omni.generate()")
     logger.info(f"Outputs: {outputs}")
 
-    # Extract images from request_output[0]['images']
     first_output = outputs[0]
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output[0]
-    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images' key")
+    request_output = first_output.request_output
+    if isinstance(request_output, list):
+        req_out = request_output[0]
+    else:
+        req_out = request_output
+    if not hasattr(req_out, "images"):
+        raise ValueError("Invalid request_output structure or missing 'images'.")
 
     images = req_out.images
     if not images:

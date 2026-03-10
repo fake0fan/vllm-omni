@@ -30,7 +30,7 @@ import pytest
 from PIL import Image
 
 from tests.utils import hardware_test
-from vllm_omni.entrypoints.omni import Omni
+from vllm_omni import Omni
 
 # Reference pixel data extracted from the known-good output image
 # Each entry contains (x, y) position and expected (R, G, B) values
@@ -100,9 +100,9 @@ def _extract_generated_image(omni_outputs: list) -> Image.Image | None:
         if images := getattr(req_output, "images", None):
             return images[0]
         if hasattr(req_output, "request_output") and req_output.request_output:
-            for stage_out in req_output.request_output:
-                if hasattr(stage_out, "images") and stage_out.images:
-                    return stage_out.images[0]
+            stage_out = req_output.request_output
+            if hasattr(stage_out, "images") and stage_out.images:
+                return stage_out.images[0]
     return None
 
 
