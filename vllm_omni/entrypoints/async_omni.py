@@ -1,5 +1,5 @@
 """
-AsyncOmni V1 - Refactored async orchestrator using AsyncOmniEngine.
+AsyncOmni - Refactored async orchestrator using AsyncOmniEngine.
 
 This is the new implementation that uses AsyncOmniEngine (which manages
 StageEngineCoreClient instances) instead of OmniStage with worker processes.
@@ -21,10 +21,10 @@ from vllm.pooling_params import PoolingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.omni_v1_base import (
-    OmniV1Base,
+from vllm_omni.entrypoints.omni_base import (
+    OmniBase,
 )
-from vllm_omni.entrypoints.omni_v1_base import (
+from vllm_omni.entrypoints.omni_base import (
     omni_snapshot_download as _omni_snapshot_download,
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
@@ -46,10 +46,10 @@ def omni_snapshot_download(model_id: str) -> str:
     return _omni_snapshot_download(model_id)
 
 
-class AsyncOmniV1(EngineClient, OmniV1Base):
+class AsyncOmni(EngineClient, OmniBase):
     """Asynchronous unified entry point for multi-stage pipelines using AsyncOmniEngine.
 
-    This is the V1 refactored version that uses AsyncOmniEngine instead of
+    This is the refactored version that uses AsyncOmniEngine instead of
     OmniStage workers. It provides the same interface as AsyncOmni but with
     a cleaner architecture.
 
@@ -64,7 +64,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
         **kwargs: Additional keyword arguments.
 
     Example:
-        >>> async_omni = AsyncOmniV1(model="Qwen/Qwen2.5-Omni-7B")
+        >>> async_omni = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
         >>> async for output in async_omni.generate(
         ...     prompt="Hello",
         ...     request_id="req-1",
@@ -84,7 +84,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
         output_modalities: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
-        OmniV1Base.__init__(
+        OmniBase.__init__(
             self,
             model=model,
             stage_configs=stage_configs,
@@ -162,7 +162,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
 
-        logger.debug(f"[AsyncOmniV1] generate() called for request {request_id}")
+        logger.debug(f"[AsyncOmni] generate() called for request {request_id}")
 
         try:
             # Start final output dispatcher on the first call to generate()
@@ -211,13 +211,13 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
             ):
                 yield output
 
-            logger.debug(f"[AsyncOmniV1] Request {request_id} completed")
+            logger.debug(f"[AsyncOmni] Request {request_id} completed")
 
             self._log_summary_and_cleanup(request_id)
 
         except (asyncio.CancelledError, GeneratorExit):
             await self.abort(request_id)
-            logger.info(f"[AsyncOmniV1] Request {request_id} aborted.")
+            logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
 
     async def encode(
@@ -234,7 +234,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
 
         Omni pipeline currently exposes only generate() API at orchestrator level.
         """
-        raise NotImplementedError("AsyncOmniV1.encode is not implemented.")
+        raise NotImplementedError("AsyncOmni.encode is not implemented.")
 
     # ==================== Processing Methods ====================
 
@@ -264,7 +264,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
             # Check for errors
             if "error" in result:
                 logger.error(
-                    "[AsyncOmniV1] Orchestrator error for req=%s stage-%s: %s",
+                    "[AsyncOmni] Orchestrator error for req=%s stage-%s: %s",
                     request_id,
                     stage_id,
                     result["error"],
@@ -283,7 +283,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
 
             if output_to_yield:
                 logger.debug(
-                    "[AsyncOmniV1] req=%s stage-%s yielding final_output_type=%s",
+                    "[AsyncOmni] req=%s stage-%s yielding final_output_type=%s",
                     request_id,
                     stage_id,
                     getattr(output_to_yield, "final_output_type", None),
@@ -328,14 +328,14 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.exception("[AsyncOmniV1] final_output_loop failed.")
+                logger.exception("[AsyncOmni] final_output_loop failed.")
                 for req_state in list(self.request_states.values()):
                     error_msg = {"request_id": req_state.request_id, "error": str(e)}
                     await req_state.queue.put(error_msg)
                 self.final_output_task = None
 
         self.final_output_task = asyncio.create_task(_final_output_loop())
-        logger.debug("[AsyncOmniV1] Final output handler started")
+        logger.debug("[AsyncOmni] Final output handler started")
 
     # ==================== Control Methods ====================
 
@@ -350,7 +350,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
         """Execute a best-effort control RPC on selected stages.
 
         Unsupported stages currently return a TODO-style result dict instead of
-        failing the entire call. This keeps V1 usable while the orchestrator
+        failing the entire call. This keeps AsyncOmni usable while the orchestrator
         control plane is still being filled out.
         """
         results = await self.engine.collective_rpc_async(
@@ -369,7 +369,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
 
         if unsupported_stage_ids:
             logger.warning(
-                "[AsyncOmniV1] collective_rpc(%s) has TODO support on stage(s): %s",
+                "[AsyncOmni] collective_rpc(%s) has TODO support on stage(s): %s",
                 method,
                 unsupported_stage_ids,
             )
@@ -394,7 +394,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
         for req_id in request_ids:
             self.request_states.pop(req_id, None)
         if self.log_stats:
-            logger.info("[AsyncOmniV1] Aborted request(s) %s", ",".join(request_ids))
+            logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
     async def pause_generation(
         self,
@@ -433,14 +433,14 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
     async def start_profile(self, stages: list[int] | None = None) -> list[Any]:
         """Start profiling specified stages.
 
-        TODO(AsyncOmniV1): normalize return payloads across LLM/diffusion stages.
+        TODO(AsyncOmni): normalize return payloads across LLM/diffusion stages.
         """
         return await self.collective_rpc(method="start_profile", stage_ids=stages)
 
     async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         """Stop profiling specified stages.
 
-        TODO(AsyncOmniV1): normalize return payloads across LLM/diffusion stages.
+        TODO(AsyncOmni): normalize return payloads across LLM/diffusion stages.
         """
         return await self.collective_rpc(method="stop_profile", stage_ids=stages)
 
@@ -449,14 +449,14 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
 
         TODO: Forward to Orchestrator process via message.
         """
-        logger.warning("[AsyncOmniV1] reset_mm_cache not yet supported with Orchestrator process")
+        logger.warning("[AsyncOmni] reset_mm_cache not yet supported with Orchestrator process")
 
     async def reset_encoder_cache(self) -> None:
         """Reset the encoder cache for all stages.
 
         TODO: Forward to Orchestrator process via message.
         """
-        logger.warning("[AsyncOmniV1] reset_encoder_cache not yet supported with Orchestrator process")
+        logger.warning("[AsyncOmni] reset_encoder_cache not yet supported with Orchestrator process")
 
     async def reset_prefix_cache(
         self,
@@ -467,7 +467,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
 
         TODO: Forward to Orchestrator process via message.
         """
-        logger.warning("[AsyncOmniV1] reset_prefix_cache not yet supported with Orchestrator process")
+        logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
         return True
 
     async def sleep(self, level: int = 1) -> None:
@@ -489,7 +489,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
     async def is_sleeping(self) -> bool:
         """Return whether all stages are sleeping.
 
-        TODO(AsyncOmniV1): query the orchestrator once all stage backends expose
+        TODO(AsyncOmni): query the orchestrator once all stage backends expose
         a real sleeping-state RPC. For now we track the requested state locally.
         """
         return self._is_sleeping
@@ -506,7 +506,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
     async def remove_lora(self, adapter_id: int) -> bool:
         """Remove a LoRA adapter from all stages.
 
-        TODO(AsyncOmniV1): add richer per-stage error reporting to the public API.
+        TODO(AsyncOmni): add richer per-stage error reporting to the public API.
         """
         results = await self.collective_rpc(method="remove_lora", args=(adapter_id,))
         concrete_results = [r for r in results if not (isinstance(r, dict) and r.get("todo"))]
@@ -602,7 +602,7 @@ class AsyncOmniV1(EngineClient, OmniV1Base):
         if self.final_output_task is not None:
             self.final_output_task.cancel()
             self.final_output_task = None
-        OmniV1Base.shutdown(self)
+        OmniBase.shutdown(self)
 
     def __del__(self):
         """Cleanup on deletion."""

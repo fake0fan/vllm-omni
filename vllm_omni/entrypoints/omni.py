@@ -11,7 +11,7 @@ from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.omni_v1_base import OmniV1Base
+from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -21,8 +21,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class OmniV1(OmniV1Base):
-    """Synchronous V1 entrypoint for offline generation."""
+class Omni(OmniBase):
+    """Synchronous entrypoint for offline generation."""
 
     def _set_final_only_for_llm_stages(
         self,
@@ -72,7 +72,7 @@ class OmniV1(OmniV1Base):
                 return self._run_generation_with_generator(prompts, sampling_params_list, use_tqdm)
             return list(self._run_generation(prompts, sampling_params_list, use_tqdm))
         except Exception as e:
-            logger.exception("[OmniV1] Failed to run generation: %s", e)
+            logger.exception("[Omni] Failed to run generation: %s", e)
             self.close()
             raise
 
@@ -149,7 +149,7 @@ class OmniV1(OmniV1Base):
                     continue
 
                 if req_id not in active_reqs:
-                    logger.warning("[OmniV1] Received output for unknown/finished request_id=%s", req_id)
+                    logger.warning("[Omni] Received output for unknown/finished request_id=%s", req_id)
                     continue
 
                 if req_state.metrics is None:
@@ -184,7 +184,7 @@ class OmniV1(OmniV1Base):
         for req_id in request_ids:
             self.request_states.pop(req_id, None)
         if self.log_stats:
-            logger.info("[OmniV1] Aborted request(s) %s", ",".join(request_ids))
+            logger.info("[Omni] Aborted request(s) %s", ",".join(request_ids))
 
     def __del__(self):
         try:

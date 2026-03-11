@@ -5,12 +5,9 @@
 vLLM-Omni entrypoints module.
 """
 
+from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
-from vllm_omni.entrypoints.async_omni_v1 import AsyncOmniV1
-from vllm_omni.entrypoints.omni_v1 import OmniV1
-
-AsyncOmni = AsyncOmniV1
-Omni = OmniV1
+from vllm_omni.entrypoints.omni import Omni
 
 __all__ = [
     "AsyncOmni",
