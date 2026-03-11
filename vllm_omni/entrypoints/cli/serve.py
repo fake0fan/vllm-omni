@@ -365,7 +365,7 @@ def _create_default_diffusion_stage_cfg(args: argparse.Namespace) -> list[dict[s
 
 
 def run_headless(args: argparse.Namespace) -> None:
-    """Run a single stage in headless mode (DEPRECATED).
+    """Run a single stage in headless mode.
 
     .. deprecated:: 0.x.x
         Headless mode is deprecated and will be removed in a future version.
