@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 import types
+import weakref
 from collections.abc import Sequence
 from pprint import pformat
 from typing import Any, Literal
@@ -23,6 +24,14 @@ logger = init_logger(__name__)
 
 def _dummy_snapshot_download(model_id: str) -> str:
     return model_id
+
+
+def _weak_shutdown_engine(engine: AsyncOmniEngine) -> None:
+    """Best-effort engine cleanup for GC finalization."""
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
 
 
 def omni_snapshot_download(model_id: str) -> str:
@@ -52,8 +61,8 @@ def omni_snapshot_download(model_id: str) -> str:
 OutputMessageHandleResult = tuple[Literal[True], None, None, None] | tuple[Literal[False], str, int, ClientRequestState]
 
 
-class OmniV1Base:
-    """Shared runtime foundation for AsyncOmniV1 and OmniV1."""
+class OmniBase:
+    """Shared runtime foundation for AsyncOmni and Omni."""
 
     def __init__(
         self,
@@ -61,13 +70,14 @@ class OmniV1Base:
         stage_configs: list[Any] | None = None,
         stage_configs_path: str | None = None,
         stage_init_timeout: int = 300,
+        init_timeout: int = 300,
         log_stats: bool = False,
         async_chunk: bool = False,
         output_modalities: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
         if "log_requests" in kwargs:
-            raise TypeError("`log_requests` has been removed in OmniV1/AsyncOmniV1. Use `log_stats`.")
+            raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
         model = omni_snapshot_download(model)
         self.model = model
         self.log_stats = log_stats
@@ -80,9 +90,12 @@ class OmniV1Base:
             model=model,
             stage_configs=stage_configs,
             stage_configs_path=stage_configs_path,
+            init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
             **kwargs,
         )
+        self._shutdown_called = False
+        self._weak_finalizer = weakref.finalize(self, _weak_shutdown_engine, self.engine)
         et = time.time()
         logger.info("[%s] AsyncOmniEngine initialized in %.2f seconds", self.__class__.__name__, et - st)
         self.async_chunk = bool(self.async_chunk or getattr(self.engine, "async_chunk", False))
@@ -273,4 +286,7 @@ class OmniV1Base:
         if getattr(self, "_shutdown_called", False):
             return
         self._shutdown_called = True
+        finalizer = getattr(self, "_weak_finalizer", None)
+        if finalizer is not None and finalizer.alive:
+            finalizer.detach()
         self.engine.shutdown()

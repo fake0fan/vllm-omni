@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import os
 import queue
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Sequence
 from typing import Any
 
 import janus
+import torch
 from omegaconf import OmegaConf
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
@@ -26,6 +29,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
@@ -65,6 +69,34 @@ def _inject_global_id(target: Any, request_id: str) -> None:
             target["additional_information"]["global_request_id"] = [str(request_id)]
 
 
+def _weak_shutdown_async_omni_engine(
+    orchestrator_thread: threading.Thread | None,
+    request_queue: janus.Queue[dict[str, Any]] | None,
+    output_queue: janus.Queue[dict[str, Any]] | None,
+    rpc_output_queue: janus.Queue[dict[str, Any]] | None,
+) -> None:
+    """Best-effort orchestrator cleanup for GC finalization."""
+    try:
+        if request_queue is not None:
+            request_queue.sync_q.put_nowait({"type": "shutdown"})
+    except Exception:
+        pass
+
+    try:
+        if orchestrator_thread is not None and orchestrator_thread.is_alive():
+            orchestrator_thread.join(timeout=10)
+    except Exception:
+        pass
+
+    for q in (request_queue, output_queue, rpc_output_queue):
+        if q is None:
+            continue
+        try:
+            q.close()
+        except Exception:
+            pass
+
+
 class AsyncOmniEngine:
     """Thin proxy that launches an Orchestrator in a background thread.
 
@@ -77,6 +109,7 @@ class AsyncOmniEngine:
         model: Model name or path
         stage_configs: List of stage configurations. If None, loads from model.
         stage_configs_path: Path to YAML file with stage configs.
+        init_timeout: Total timeout waiting for orchestrator startup (seconds).
         stage_init_timeout: Timeout for stage initialization (seconds)
         **kwargs: Additional arguments
     """
@@ -377,9 +410,11 @@ class AsyncOmniEngine:
         stage_configs: list[Any] | None = None,
         stage_configs_path: str | None = None,
         stage_init_timeout: int = 300,
+        init_timeout: int = 300,
         **kwargs: Any,
     ) -> None:
         self.model = model
+        startup_timeout = int(init_timeout)
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -395,7 +430,10 @@ class AsyncOmniEngine:
                 resolved_configs = OmegaConf.create(resolved_configs)
         elif stage_configs_path is None:
             self.config_path = resolve_model_config_path(model)
-            resolved_configs = load_stage_configs_from_model(model, base_engine_args=base_engine_args)
+            resolved_configs = load_stage_configs_from_model(
+                config_path=self.config_path,
+                base_engine_args=base_engine_args,
+            )
             if not resolved_configs:
                 default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
                 resolved_configs = OmegaConf.create(default_stage_cfg)
@@ -417,6 +455,8 @@ class AsyncOmniEngine:
         self.request_queue: janus.Queue[dict[str, Any]] | None = None
         self.output_queue: janus.Queue[dict[str, Any]] | None = None
         self.rpc_output_queue: janus.Queue[dict[str, Any]] | None = None
+        self._shutdown_called = False
+        self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
         self._llm_stage_launch_lock = threading.Lock()
 
@@ -438,13 +478,13 @@ class AsyncOmniEngine:
 
         # Wait for stage/runtime initialization result from orchestrator thread.
         try:
-            startup_future.result(timeout=stage_init_timeout)
+            startup_future.result(timeout=startup_timeout)
         except concurrent.futures.TimeoutError as e:
             try:
                 self.shutdown()
             except Exception:
                 logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
-            raise TimeoutError(f"Orchestrator did not become ready within {stage_init_timeout}s") from e
+            raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s") from e
         except Exception:
             try:
                 self.shutdown()
@@ -453,6 +493,14 @@ class AsyncOmniEngine:
             raise
 
         # Stage runtime fields are assigned directly on self by the bootstrap thread.
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_shutdown_async_omni_engine,
+            self.orchestrator_thread,
+            self.request_queue,
+            self.output_queue,
+            self.rpc_output_queue,
+        )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
 
@@ -525,17 +573,114 @@ class AsyncOmniEngine:
         }
 
     @staticmethod
+    def _get_default_cache_config(cache_backend: str | None) -> dict[str, Any] | None:
+        if cache_backend == "cache_dit":
+            return {
+                "Fn_compute_blocks": 1,
+                "Bn_compute_blocks": 0,
+                "max_warmup_steps": 4,
+                "residual_diff_threshold": 0.24,
+                "max_continuous_cached_steps": 3,
+                "enable_taylorseer": False,
+                "taylorseer_order": 1,
+                "scm_steps_mask_policy": None,
+                "scm_steps_policy": "dynamic",
+            }
+        if cache_backend == "tea_cache":
+            return {
+                "rel_l1_thresh": 0.2,
+            }
+        return None
+
+    @staticmethod
+    def _normalize_cache_config(cache_backend: str | None, cache_config: Any | None) -> Any | None:
+        if isinstance(cache_config, str):
+            try:
+                cache_config = json.loads(cache_config)
+            except json.JSONDecodeError:
+                logger.warning("Invalid cache_config JSON, using defaults.")
+                cache_config = None
+        if cache_config is None and cache_backend not in (None, "", "none"):
+            cache_config = AsyncOmniEngine._get_default_cache_config(cache_backend)
+        return cache_config
+
+    @staticmethod
     def _create_default_diffusion_stage_cfg(kwargs: dict[str, Any]) -> list:
         """Create a default single-stage diffusion config from kwargs."""
-        return [
+        # We temporally create a default config for diffusion stage.
+        # In the future, we should merge the default config with the user-provided config.
+        normalized_kwargs = dict(kwargs)
+
+        # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
+        if "dtype" in normalized_kwargs and not isinstance(normalized_kwargs["dtype"], str):
+            if not isinstance(normalized_kwargs["dtype"], torch.dtype):
+                raise TypeError(
+                    f"Provided dtype must be a string or torch.dtype, got {type(normalized_kwargs['dtype']).__name__}"
+                )
+            normalized_kwargs["dtype"] = str(normalized_kwargs["dtype"]).removeprefix("torch.")
+
+        cache_backend = normalized_kwargs.get("cache_backend", "none")
+        cache_config = AsyncOmniEngine._normalize_cache_config(
+            cache_backend,
+            normalized_kwargs.get("cache_config", None),
+        )
+
+        parallel_config = normalized_kwargs.get("parallel_config")
+        if isinstance(parallel_config, dict):
+            parallel_config = DiffusionParallelConfig.from_dict(parallel_config)
+        if parallel_config is None:
+            ulysses_degree = normalized_kwargs.get("ulysses_degree") or 1
+            ring_degree = normalized_kwargs.get("ring_degree") or 1
+            sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
+            tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
+            cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
+            vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
+            use_hsdp = normalized_kwargs.get("use_hsdp", False)
+            hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
+            hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
+            if sequence_parallel_size is None:
+                sequence_parallel_size = ulysses_degree * ring_degree
+
+            parallel_config = DiffusionParallelConfig(
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                tensor_parallel_size=tensor_parallel_size,
+                sequence_parallel_size=sequence_parallel_size,
+                ulysses_degree=ulysses_degree,
+                ring_degree=ring_degree,
+                cfg_parallel_size=cfg_parallel_size,
+                vae_patch_parallel_size=vae_patch_parallel_size,
+                use_hsdp=use_hsdp,
+                hsdp_shard_size=hsdp_shard_size,
+                hsdp_replicate_size=hsdp_replicate_size,
+            )
+
+        num_devices = max(1, int(parallel_config.world_size))
+        devices = ",".join(str(i) for i in range(num_devices))
+        normalized_kwargs["parallel_config"] = parallel_config
+
+        default_stage_cfg = [
             {
                 "stage_id": 0,
                 "stage_type": "diffusion",
-                "engine_args": kwargs,
+                "runtime": {
+                    "process": True,
+                    "devices": devices,
+                    "max_batch_size": 1,
+                },
+                "engine_args": OmegaConf.create(
+                    {
+                        **normalized_kwargs,
+                        "cache_backend": cache_backend,
+                        "cache_config": cache_config,
+                    }
+                ),
                 "final_output": True,
                 "final_output_type": "image",
             }
         ]
+        default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
+        return default_stage_cfg
 
     # ==================== Public API ====================
 
@@ -701,6 +846,13 @@ class AsyncOmniEngine:
 
     def shutdown(self) -> None:
         """Send shutdown message and wait for the Orchestrator thread to exit."""
+        if getattr(self, "_shutdown_called", False):
+            return
+        self._shutdown_called = True
+        finalizer = getattr(self, "_weak_finalizer", None)
+        if finalizer is not None and finalizer.alive:
+            finalizer.detach()
+
         logger.info("[AsyncOmniEngine] Shutting down Orchestrator")
         try:
             if self.request_queue is not None:
@@ -719,9 +871,3 @@ class AsyncOmniEngine:
                 q.close()
             except Exception:
                 pass
-
-    def __del__(self) -> None:
-        try:
-            self.shutdown()
-        except Exception:
-            pass

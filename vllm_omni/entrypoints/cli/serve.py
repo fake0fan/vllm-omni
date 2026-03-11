@@ -8,36 +8,19 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 import argparse
 import json
 import os
-import signal
 from typing import Any
 
-import msgspec.msgpack
 import uvloop
-import zmq
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.utils.network_utils import make_zmq_socket
-from vllm.v1.utils import get_engine_client_zmq_addr
 
-from vllm_omni.distributed.omni_connectors import (
-    get_connectors_config_for_stage,
-    load_omni_transfer_config,
-)
-from vllm_omni.distributed.omni_connectors.utils.initialization import (
-    resolve_omni_kv_config_for_stage,
-)
 from vllm_omni.entrypoints.cli.logo import log_logo
-from vllm_omni.entrypoints.omni import OmniBase, omni_snapshot_download
-from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
-from vllm_omni.entrypoints.utils import inject_omni_kv_config
 
 logger = init_logger(__name__)
-
-HANDSHAKE_TIMEOUT_MINS = 5
 
 DESCRIPTION = """Launch a local OpenAI-compatible API server to serve Omni models
 via HTTP. Supports both multi-stage LLM models and diffusion models.
