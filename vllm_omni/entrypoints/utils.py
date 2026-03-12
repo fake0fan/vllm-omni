@@ -292,7 +292,7 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
             base_engine_args_tmp["max_num_seqs"] = max_batch_size
             base_engine_args_tmp["async_chunk"] = global_async_chunk
         stage_arg["engine_args"] = base_engine_args_tmp
-    return stage_args
+    return OmegaConf.create(stage_args)
 
 
 def load_and_resolve_stage_configs(
