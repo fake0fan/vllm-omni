@@ -275,24 +275,23 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     """
     if base_engine_args is None:
         base_engine_args = {}
-    config_data = OmegaConf.load(config_path)
-    stage_args = config_data.stage_args
+    config_data = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
+    stage_args = config_data["stage_args"]
     global_async_chunk = config_data.get("async_chunk", False)
-    # Convert any nested dataclass objects to dicts before creating OmegaConf
+    # Convert any nested dataclass objects to dicts before merging
     base_engine_args = _convert_dataclasses_to_dict(base_engine_args)
-    base_engine_args = OmegaConf.create(base_engine_args)
     for stage_arg in stage_args:
         base_engine_args_tmp = base_engine_args.copy()
         # Update base_engine_args with stage-specific engine_args if they exist
-        if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
-            base_engine_args_tmp = OmegaConf.merge(base_engine_args_tmp, stage_arg.engine_args)
-        stage_type = getattr(stage_arg, "stage_type", "llm")
-        if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
-            runtime_cfg = stage_arg.runtime
+        if stage_arg.get("engine_args") is not None:
+            base_engine_args_tmp = {**base_engine_args_tmp, **stage_arg["engine_args"]}
+        stage_type = stage_arg.get("stage_type", "llm")
+        if stage_arg.get("runtime") is not None and stage_type != "diffusion":
+            runtime_cfg = stage_arg["runtime"]
             max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
             base_engine_args_tmp["max_num_seqs"] = max_batch_size
-            base_engine_args_tmp.async_chunk = global_async_chunk
-        stage_arg.engine_args = base_engine_args_tmp
+            base_engine_args_tmp["async_chunk"] = global_async_chunk
+        stage_arg["engine_args"] = base_engine_args_tmp
     return stage_args
 
 
