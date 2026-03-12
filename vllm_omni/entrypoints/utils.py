@@ -1,7 +1,7 @@
 import os
 import types
 from collections import Counter
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
@@ -144,7 +144,10 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     # Note: asdict() recursively converts nested dataclasses but not Counter objects,
     # so we need to recursively process the result
     if is_dataclass(obj):
-        result = asdict(obj)
+        # Only include init=True fields to avoid passing runtime-only fields
+        # (e.g. CompilationConfig has init=False fields like enabled_custom_ops,
+        # compilation_time, etc. that pydantic rejects when passed back to __init__)
+        result = {f.name: getattr(obj, f.name) for f in fields(obj) if f.init}
         # Recursively process the result to convert any Counter objects
         return _convert_dataclasses_to_dict(result)
     # Handle dictionaries (recurse into values) and filter out callables(cause error in OmegaConf.create)
