@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import dataclasses
 import json
 import os
 import queue
@@ -17,7 +18,10 @@ import time
 import uuid
 import weakref
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
 
 import janus
 import torch
@@ -403,6 +407,7 @@ class AsyncOmniEngine:
     def __init__(
         self,
         model: str,
+        engine_args: OmniEngineArgs | None = None,
         stage_init_timeout: int = 300,
         init_timeout: int = 300,
         **kwargs: Any,
@@ -411,6 +416,17 @@ class AsyncOmniEngine:
         startup_timeout = int(init_timeout)
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
+
+        # Merge typed engine_args fields into kwargs; explicit kwargs take priority.
+        if engine_args is not None:
+            ea_dict = {
+                f.name: getattr(engine_args, f.name)
+                for f in dataclasses.fields(engine_args)
+                if not f.name.startswith("_")
+            }
+            # Remove model since it is passed as a positional arg already.
+            ea_dict.pop("model", None)
+            kwargs = {**ea_dict, **kwargs}
 
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
@@ -656,9 +672,6 @@ class AsyncOmniEngine:
 
     def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
-        # TODO(wuhang):
-        # Remove kwargs as parameters in the future.
-        # Use dataclass directly for engine args.
 
         stage_configs_path = kwargs.get("stage_configs_path", None)
 

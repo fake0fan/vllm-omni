@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
     from vllm.tokenizers import TokenizerLike
 
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
     from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
 logger = init_logger(__name__)
@@ -67,6 +68,7 @@ class AsyncOmni(EngineClient, OmniBase):
     def __init__(
         self,
         model: str,
+        engine_args: OmniEngineArgs | None = None,
         stage_init_timeout: int = 300,
         init_timeout: int = 300,
         log_stats: bool = False,
@@ -74,9 +76,13 @@ class AsyncOmni(EngineClient, OmniBase):
         output_modalities: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
+        # When engine_args is provided, prefer its async_chunk over the explicit param.
+        if engine_args is not None:
+            async_chunk = engine_args.async_chunk
         OmniBase.__init__(
             self,
             model=model,
+            engine_args=engine_args,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
             log_stats=log_stats,
