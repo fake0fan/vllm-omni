@@ -195,7 +195,7 @@ class _DiffusionServingModels:
             raise NotImplementedError(f"{self.name}.{attr} is not supported in diffusion mode")
 
     def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
-        self._base_model_paths = base_model_paths
+        self.base_model_paths = base_model_paths
         self.model_config = self._NullModelConfig()
 
     def __getattr__(self, name):
@@ -212,7 +212,7 @@ class _DiffusionServingModels:
                     root=base_model.model_path,
                     permission=[ModelPermission()],
                 )
-                for base_model in self._base_model_paths
+                for base_model in self.base_model_paths
             ]
         )
 
