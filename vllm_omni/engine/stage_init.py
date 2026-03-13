@@ -26,7 +26,7 @@ from vllm.v1.executor import Executor
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.worker_cls_utils import resolve_worker_cls
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
-from vllm_omni.entrypoints.utils import resolve_model_config_path
+from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 
 logger = init_logger(__name__)
@@ -167,8 +167,10 @@ def build_engine_args_dict(
 
     engine_args_dict = _to_dict(engine_args)
     engine_args_dict["model"] = model
+    # Stage id must come from stage config instead of inherited CLI kwargs
+    # (e.g. `--stage-id` defaulting to None).
+    engine_args_dict["stage_id"] = stage_id
     if engine_args_dict.get("async_chunk", False):
-        engine_args_dict["stage_id"] = stage_id
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
     if stage_type != "diffusion":
@@ -196,9 +198,8 @@ def build_vllm_config(
             stage_connector_spec=stage_connector_spec,
         )
 
-    logger.info("[stage_init] Stage-%s engine_args_dict: %s", stage_id, engine_args_dict)
-
-    omni_engine_args = OmniEngineArgs(**engine_args_dict)
+    filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
+    omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
     vllm_config = omni_engine_args.create_engine_config(usage_context=UsageContext.LLM_CLASS)
     executor_class = Executor.get_class(vllm_config)
 
