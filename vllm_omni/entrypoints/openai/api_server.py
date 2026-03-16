@@ -164,6 +164,17 @@ def _remove_route_from_router(
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 
 
+def _get_stage_type(stage_cfg: Any) -> str:
+    if isinstance(stage_cfg, dict):
+        return stage_cfg.get("stage_type", "llm")
+    if hasattr(stage_cfg, "get"):
+        try:
+            return stage_cfg.get("stage_type", "llm")
+        except Exception:
+            pass
+    return getattr(stage_cfg, "stage_type", "llm")
+
+
 def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
     """Remove a route from the app by path and optionally by methods.
 
@@ -446,7 +457,7 @@ async def omni_init_app_state(
     if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
         stage_configs = engine_client.stage_configs
         if len(stage_configs) == 1:
-            stage_type = stage_configs[0].get("stage_type", "llm")
+            stage_type = _get_stage_type(stage_configs[0])
             if stage_type == "diffusion":
                 is_pure_diffusion = True
                 logger.info("Detected pure diffusion mode (single diffusion stage)")
@@ -545,14 +556,13 @@ async def omni_init_app_state(
             try:
                 from vllm.plugins.io_processors import get_io_processor
 
-                from vllm_omni.engine.input_processor import OmniInputProcessor
+                from vllm.v1.engine.input_processor import InputProcessor
 
                 tokenizer = await engine_client.get_tokenizer()
                 if tokenizer is not None:
                     # Initialize input_processor
-                    # OMNI: OmniInputProcessor creates tokenizer internally from vllm_config
                     if not hasattr(engine_client, "input_processor") or engine_client.input_processor is None:
-                        engine_client.input_processor = OmniInputProcessor(
+                        engine_client.input_processor = InputProcessor(
                             vllm_config=vllm_config,
                         )
                         logger.info("Initialized input_processor for AsyncOmni")
@@ -1434,7 +1444,7 @@ async def edit_images(
 def _get_engine_and_model(raw_request: Request):
     # Get engine client (AsyncOmni) from app state
     engine_client: EngineClient | AsyncOmni | None = getattr(raw_request.app.state, "engine_client", None)
-    if engine_client is None or not hasattr(engine_client, "stage_list"):
+    if engine_client is None:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
             detail="Multi-stage engine not initialized. Start server with a multi-stage omni model.",
@@ -1452,20 +1462,7 @@ def _get_engine_and_model(raw_request: Request):
     has_diffusion_stage = False
     stage_types: list[str] = []
     for stage in stage_configs:
-        # Handle both dict and OmegaConf objects
-        stage_type = None
-        if isinstance(stage, dict):
-            stage_type = stage.get("stage_type", "llm")
-        elif hasattr(stage, "get"):
-            stage_type = stage.get("stage_type", "llm")
-        elif hasattr(stage, "stage_type"):
-            stage_type = stage.stage_type
-        else:
-            # Fallback: try to access as dict-like
-            try:
-                stage_type = stage["stage_type"] if "stage_type" in stage else "llm"
-            except (TypeError, KeyError):
-                stage_type = "llm"
+        stage_type = _get_stage_type(stage)
 
         if stage_type == "diffusion":
             has_diffusion_stage = True
@@ -1479,8 +1476,9 @@ def _get_engine_and_model(raw_request: Request):
 
     # Get server's loaded model name
     serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
-    if serving_models and hasattr(serving_models, "_base_model_paths") and serving_models._base_model_paths:
-        model_name = serving_models._base_model_paths[0].name
+    base_model_paths = getattr(serving_models, "base_model_paths", None) if serving_models else None
+    if base_model_paths:
+        model_name = base_model_paths[0].name
     else:
         model_name = "unknown"
 
@@ -1542,21 +1540,26 @@ async def _generate_with_async_omni(
 ):
     engine_client = cast(AsyncOmni, engine_client)
     result = None
-    stage_list = getattr(engine_client, "stage_list", None)
-    if isinstance(stage_list, list):
+    if stage_types:
         default_params_list: list[OmniSamplingParams] | None = getattr(
-            engine_client, "default_sampling_params_list", None
+            engine_client,
+            "default_sampling_params_list",
+            None,
         )
         if not isinstance(default_params_list, list):
             default_params_list = [
-                OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types
+                OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams()
+                for st in stage_types
             ]
         else:
             default_params_list = list(default_params_list)
         if len(default_params_list) != len(stage_types):
             default_params_list = (
                 default_params_list
-                + [OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types]
+                + [
+                    OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams()
+                    for st in stage_types
+                ]
             )[: len(stage_types)]
 
         sampling_params_list: list[OmniSamplingParams] = []
@@ -1564,19 +1567,15 @@ async def _generate_with_async_omni(
             if stage_type == "diffusion":
                 sampling_params_list.append(gen_params)
             else:
-                base_params = default_params_list[idx]
-                sampling_params_list.append(base_params)
-
-        async for output in engine_client.generate(
-            sampling_params_list=sampling_params_list,
-            **kwargs,
-        ):
-            result = output
+                sampling_params_list.append(default_params_list[idx])
     else:
-        result = await engine_client.generate(
-            sampling_params_list=[gen_params],
-            **kwargs,
-        )
+        sampling_params_list = [gen_params]
+
+    async for output in engine_client.generate(
+        sampling_params_list=sampling_params_list,
+        **kwargs,
+    ):
+        result = output
 
     if result is None:
         raise HTTPException(

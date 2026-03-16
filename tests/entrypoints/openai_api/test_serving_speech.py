@@ -1034,15 +1034,12 @@ class TestAsyncOmniSupportedTasks:
     @pytest.mark.asyncio
     async def test_tts_only_no_generate_task(self):
         """TTS-only models (audio output, no text) should not include 'generate'."""
-        from unittest.mock import MagicMock
+        from types import SimpleNamespace
 
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         omni = AsyncOmni.__new__(AsyncOmni)
-        omni.output_modalities = [None, "audio"]
-        stage = MagicMock()
-        stage.is_comprehension = False
-        omni.stage_list = [stage]
+        omni.engine = SimpleNamespace(supported_tasks=("speech",))
         tasks = await omni.get_supported_tasks()
         assert "generate" not in tasks
         assert "speech" in tasks
@@ -1050,15 +1047,12 @@ class TestAsyncOmniSupportedTasks:
     @pytest.mark.asyncio
     async def test_omni_model_includes_generate(self):
         """Models with text output (e.g. Qwen3-Omni) should include 'generate'."""
-        from unittest.mock import MagicMock
+        from types import SimpleNamespace
 
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         omni = AsyncOmni.__new__(AsyncOmni)
-        omni.output_modalities = ["text", None, "audio"]
-        stage = MagicMock()
-        stage.is_comprehension = True
-        omni.stage_list = [stage]
+        omni.engine = SimpleNamespace(supported_tasks=("generate", "speech"))
         tasks = await omni.get_supported_tasks()
         assert "generate" in tasks
 

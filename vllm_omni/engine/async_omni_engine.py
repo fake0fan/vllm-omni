@@ -456,6 +456,7 @@ class AsyncOmniEngine:
         self,
         model: str,
         engine_args: OmniEngineArgs | None = None,
+        stage_configs: list[Any] | None = None,
         stage_init_timeout: int = 300,
         init_timeout: int = 600,
         **kwargs: Any,
@@ -475,6 +476,8 @@ class AsyncOmniEngine:
             # Remove model since it is passed as a positional arg already.
             ea_dict.pop("model", None)
             kwargs = {**ea_dict, **kwargs}
+        if stage_configs is not None:
+            kwargs["stage_configs"] = stage_configs
 
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
@@ -736,6 +739,7 @@ class AsyncOmniEngine:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
         stage_configs_path = kwargs.get("stage_configs_path", None)
+        explicit_stage_configs = kwargs.get("stage_configs", None)
 
         # TTS-specific CLI overrides
         self.tts_max_instructions_length: int | None = kwargs.get("tts_max_instructions_length", None)
@@ -743,7 +747,22 @@ class AsyncOmniEngine:
         # Resolve stage configurations without implicit fallback.
         # - Explicit stage_configs_path: trust user-provided YAML.
         # - Otherwise: require StageConfigFactory model pipeline resolution.
-        if stage_configs_path is not None:
+        if explicit_stage_configs is not None:
+            if stage_configs_path is not None:
+                logger.warning(
+                    "Both stage_configs and stage_configs_path are provided. "
+                    "Using explicit stage_configs and ignoring stage_configs_path."
+                )
+            config_path = stage_configs_path or ""
+            stage_configs = []
+            for stage in explicit_stage_configs:
+                if hasattr(stage, "to_omegaconf"):
+                    stage_configs.append(stage.to_omegaconf())
+                elif isinstance(stage, dict):
+                    stage_configs.append(OmegaConf.create(stage))
+                else:
+                    stage_configs.append(stage)
+        elif stage_configs_path is not None:
             config_path = stage_configs_path
             stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=kwargs)
         else:

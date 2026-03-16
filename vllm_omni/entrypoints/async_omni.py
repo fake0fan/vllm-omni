@@ -596,7 +596,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
     async def check_health(self) -> None:
         """Check engine health by verifying the Orchestrator process is alive."""
-        super().check_health()
+        OmniBase.check_health(self)
 
     # ==================== Shutdown ====================
 

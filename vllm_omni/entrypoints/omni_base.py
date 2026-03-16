@@ -25,10 +25,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _dummy_snapshot_download(model_id: str) -> str:
-    return model_id
-
-
 def _weak_shutdown_engine(engine: AsyncOmniEngine) -> None:
     """Best-effort engine cleanup for GC finalization."""
     try:
