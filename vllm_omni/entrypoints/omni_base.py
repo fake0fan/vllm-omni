@@ -66,14 +66,15 @@ class OmniBase:
     def __init__(
         self,
         model: str,
-        engine_args: OmniEngineArgs | None = None,
-        stage_init_timeout: int = 300,
-        init_timeout: int = 600,
-        log_stats: bool = False,
-        async_chunk: bool = False,
-        output_modalities: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
+        engine_args: OmniEngineArgs | None = kwargs.pop("engine_args", None)
+        stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
+        init_timeout = kwargs.pop("init_timeout", 600)
+        log_stats = kwargs.pop("log_stats", False)
+        async_chunk = kwargs.pop("async_chunk", False)
+        output_modalities = kwargs.pop("output_modalities", None)
+
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
         model = omni_snapshot_download(model)

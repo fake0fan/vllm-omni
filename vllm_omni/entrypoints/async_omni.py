@@ -45,14 +45,16 @@ class AsyncOmni(EngineClient, OmniBase):
 
     Args:
         model: Model name or path to load.
-        stage_configs: Optional list of stage configurations. If None, loads from model.
-        stage_configs_path: Optional path to YAML file containing stage configurations.
-        init_timeout: Total timeout for orchestrator startup (seconds).
-        stage_init_timeout: Timeout for stage initialization (seconds).
-        log_stats: Whether to enable statistics logging.
-        async_chunk: Whether to use async chunk mode (parallel stage execution).
-        output_modalities: List of output modalities.
         **kwargs: Additional keyword arguments.
+            - stage_configs_path: Optional path to YAML file containing stage
+              configurations. If None, configurations are resolved from model
+              pipeline factory.
+            - log_stats: Whether to enable statistics logging.
+            - stage_init_timeout: Timeout for per-stage initialization.
+            - init_timeout: Total timeout for orchestrator startup.
+            - async_chunk: Whether to enable async chunk mode.
+            - output_modalities: Requested output modalities.
+            - Additional keyword arguments passed to stage engines.
 
     Example:
         >>> async_omni = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
@@ -64,30 +66,8 @@ class AsyncOmni(EngineClient, OmniBase):
         ...     print(output)
     """
 
-    def __init__(
-        self,
-        model: str,
-        stage_configs: list[Any] | None = None,
-        stage_configs_path: str | None = None,
-        stage_init_timeout: int = 300,
-        init_timeout: int = 600,
-        log_stats: bool = False,
-        async_chunk: bool = False,
-        output_modalities: list[str] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        OmniBase.__init__(
-            self,
-            model=model,
-            stage_configs=stage_configs,
-            stage_configs_path=stage_configs_path,
-            init_timeout=init_timeout,
-            stage_init_timeout=stage_init_timeout,
-            log_stats=log_stats,
-            async_chunk=async_chunk,
-            output_modalities=output_modalities,
-            **kwargs,
-        )
+    def __init__(self, model: str, **kwargs: Any) -> None:
+        OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
         self._is_sleeping: bool = False
@@ -132,6 +112,10 @@ class AsyncOmni(EngineClient, OmniBase):
         if stage_index is None:
             return None
         return self.engine.stage_vllm_configs[stage_index]
+
+    async def get_vllm_config(self) -> Any:
+        """Compatibility helper for call sites expecting async vllm config access."""
+        return self.vllm_config
 
     @property
     def model_config(self):

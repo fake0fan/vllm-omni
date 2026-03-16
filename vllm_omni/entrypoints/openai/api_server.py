@@ -83,7 +83,6 @@ from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.system_utils import decorate_logs
 
-from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -162,6 +161,12 @@ def _remove_route_from_router(
 
 
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
+
+
+async def _get_vllm_config(engine_client: EngineClient) -> Any:
+    if hasattr(engine_client, "get_vllm_config"):
+        return await engine_client.get_vllm_config()
+    return getattr(engine_client, "vllm_config", None)
 
 
 def _get_stage_type(stage_cfg: Any) -> str:
@@ -306,7 +311,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
             app.include_router(profiler_router)
 
-        vllm_config = engine_client.vllm_config
+        vllm_config = await _get_vllm_config(engine_client)
 
         # Check if pure diffusion mode (vllm_config will be None)
         is_pure_diffusion = vllm_config is None
@@ -420,8 +425,9 @@ async def build_async_omni_from_stage_config(
     async_omni: EngineClient | None = None
 
     try:
-        engine_args = OmniEngineArgs.from_cli_args(args)
-        async_omni = AsyncOmni(model=engine_args.model, engine_args=engine_args)
+        kwargs = vars(args).copy()
+        kwargs.pop("model", None)
+        async_omni = AsyncOmni(model=args.model, **kwargs)
 
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()
@@ -450,7 +456,7 @@ async def omni_init_app_state(
         args: Parsed command-line arguments
     """
     # Get vllm_config from engine_client (following 0.14.0 pattern)
-    vllm_config = engine_client.vllm_config
+    vllm_config = await _get_vllm_config(engine_client)
 
     # Detect if it's pure Diffusion mode (single stage and is Diffusion)
     is_pure_diffusion = False
@@ -510,7 +516,7 @@ async def omni_init_app_state(
     # LLM or multi-stage mode: use standard initialization logic
     if vllm_config is None:
         # Try to get vllm_config from engine_client
-        vllm_config = engine_client.vllm_config
+        vllm_config = await _get_vllm_config(engine_client)
         if vllm_config is None:
             logger.warning("vllm_config is None, some features may not work correctly")
 
