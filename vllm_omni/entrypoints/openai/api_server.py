@@ -429,26 +429,11 @@ async def build_async_omni_from_stage_config(
         init_timeout = getattr(args, "init_timeout", 600)
         stage_init_timeout = getattr(args, "stage_init_timeout", 300)
 
-        # TODO: Refactor configuration loading to avoid passing a large number of CLI args into AsyncOmni.
-        extra_omni_kwargs: dict[str, Any] = {}
-        for _key in (
-            "stage_configs_path",
-            "async_chunk",
-            "output_modalities",
-            "log_stats",
-            "omni_master_address",
-            "omni_master_port",
-        ):
-            _val = getattr(args, _key, None)
-            if _val is not None:
-                extra_omni_kwargs[_key] = _val
-
         async_omni = AsyncOmni(
             model=engine_args.model,
             engine_args=engine_args,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
-            **extra_omni_kwargs,
         )
 
         # # Don't keep the dummy data in memory

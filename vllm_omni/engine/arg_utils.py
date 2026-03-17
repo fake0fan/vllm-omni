@@ -78,6 +78,13 @@ class OmniEngineArgs(EngineArgs):
             Required when single-stage mode is active.
         omni_master_port: TCP port for the OmniMasterServer registration
             socket.  Required when single-stage mode is active.
+        stage_configs_path: Optional path to a JSON/YAML file containing
+            stage configurations for the multi-stage pipeline. If None,
+            stage configs are resolved from the model's default configuration.
+        output_modalities: Optional list of output modality names to enable
+            (e.g. ["text", "audio"]). If None, all modalities supported by
+            the model are used.
+        log_stats: Whether to log engine statistics. Defaults to True.
     """
 
     stage_id: int | None = None
@@ -94,6 +101,9 @@ class OmniEngineArgs(EngineArgs):
     task_type: str | None = None
     omni_master_address: str | None = None
     omni_master_port: int | None = None
+    stage_configs_path: str | None = None
+    output_modalities: list[str] | None = None
+    log_stats: bool = True
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()
