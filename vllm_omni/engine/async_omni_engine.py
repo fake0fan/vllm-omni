@@ -553,6 +553,11 @@ class AsyncOmniEngine:
                 stage_clients,
                 [started_llm_stages[stage_id] for stage_id in llm_stage_ids if stage_id in started_llm_stages],
             )
+            if self._omni_master_server is not None:
+                try:
+                    self._omni_master_server.stop()
+                except Exception:
+                    logger.exception("[AsyncOmniEngine] Failed to stop OmniMasterServer during stage-init cleanup")
             raise
 
         self.stage_clients = initialized_stage_clients
@@ -1250,3 +1255,10 @@ class AsyncOmniEngine:
                 q.close()
             except Exception:
                 pass
+
+        if self._omni_master_server is not None:
+            try:
+                self._omni_master_server.stop()
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed to stop OmniMasterServer during shutdown")
+            self._omni_master_server = None
