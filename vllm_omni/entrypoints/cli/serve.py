@@ -380,7 +380,7 @@ def run_headless(args: argparse.Namespace) -> None:
 
     from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_omni_kv_config_for_stage
     from vllm_omni.engine.omni_core_engine import run_omni_engine_core
-    from vllm_omni.engine.stage_init import (
+    from vllm_omni.engine.stage_init_utils import (
         build_engine_args_dict,
         build_vllm_config,
         get_stage_connector_spec,
