@@ -169,6 +169,7 @@ class AsyncOmniEngine:
         metadata: Any,
         stage_connector_spec: dict[str, Any],
         stage_init_timeout: int,
+        llm_stage_launch_lock: threading.Lock,
     ) -> StartedLlmStage:
         """Launch one LLM stage to READY state in a helper thread."""
         from vllm_omni.platforms import current_omni_platform
@@ -178,7 +179,7 @@ class AsyncOmniEngine:
         device_control_env = current_omni_platform.device_control_env_var
 
         try:
-            with self._llm_stage_launch_lock:
+            with llm_stage_launch_lock:
                 previous_visible_devices = os.environ.get(device_control_env)
                 try:
                     setup_stage_devices(metadata.stage_id, metadata.runtime_cfg)
@@ -302,6 +303,7 @@ class AsyncOmniEngine:
         llm_stage_ids: list[int] = []
         llm_launch_futures: dict[int, concurrent.futures.Future[StartedLlmStage]] = {}
         started_llm_stages: dict[int, StartedLlmStage] = {}
+        llm_stage_launch_lock = threading.Lock()
 
         async_chunk = self.async_chunk
         llm_stage_count = sum(
@@ -339,6 +341,7 @@ class AsyncOmniEngine:
                         metadata,
                         stage_connector_spec,
                         stage_init_timeout,
+                        llm_stage_launch_lock,
                     )
 
                 concurrent.futures.wait(list(llm_launch_futures.values()))
@@ -495,7 +498,6 @@ class AsyncOmniEngine:
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
-        self._llm_stage_launch_lock = threading.Lock()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -743,9 +745,6 @@ class AsyncOmniEngine:
                 "`stage_configs` is not part of the public API. "
                 "Ignoring it and resolving stages from stage_configs_path/model factory."
             )
-
-        # TTS-specific CLI overrides
-        self.tts_max_instructions_length: int | None = kwargs.get("tts_max_instructions_length", None)
 
         # Resolve stage configurations without implicit fallback.
         # - Explicit stage_configs_path: trust user-provided YAML.
