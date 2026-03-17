@@ -15,7 +15,6 @@ import os
 import queue
 import threading
 import time
-import types
 import uuid
 import weakref
 from collections.abc import Sequence
@@ -63,7 +62,6 @@ from vllm_omni.engine.stage_init_utils import (
 )
 from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
-    load_stage_configs_from_yaml,
 )
 
 logger = init_logger(__name__)
