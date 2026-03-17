@@ -83,6 +83,7 @@ from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.system_utils import decorate_logs
 
+from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -424,9 +425,15 @@ async def build_async_omni_from_stage_config(
     async_omni: EngineClient | None = None
 
     try:
-        kwargs = vars(args).copy()
-        kwargs.pop("model", None)
-        async_omni = AsyncOmni(model=args.model, **kwargs)
+        engine_args = OmniEngineArgs.from_cli_args(args)
+        init_timeout = getattr(args, "init_timeout", 600)
+        stage_init_timeout = getattr(args, "stage_init_timeout", 300)
+        async_omni = AsyncOmni(
+            model=engine_args.model,
+            engine_args=engine_args,
+            init_timeout=init_timeout,
+            stage_init_timeout=stage_init_timeout,
+        )
 
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()
