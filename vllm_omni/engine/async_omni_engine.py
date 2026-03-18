@@ -40,6 +40,7 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
 from vllm_omni.engine import (
     OmniEngineCoreRequest,
 )
+from vllm_omni.engine.omni_core_engine import OmniMasterServer, connect_remote_engine_cores, launch_omni_core_engines
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.serialization import serialize_additional_information
@@ -243,13 +244,26 @@ class AsyncOmniEngine:
                         engine_args_dict,
                         stage_init_timeout,
                     )
-                    addresses = get_engine_zmq_addresses(vllm_config)
-                    launch_cm = launch_core_engines(
-                        vllm_config=vllm_config,
-                        executor_class=executor_class,
-                        log_stats=False,
-                        addresses=addresses,
-                    )
+                    # In single-stage mode use the OmniMasterServer's pre-allocated
+                    # addresses and the omni-specific launch path.
+                    if self.single_stage_mode and self._omni_master_server is not None:
+                        addresses = self._omni_master_server.get_zmq_addresses(metadata.stage_id)
+                        launch_cm = launch_omni_core_engines(
+                            vllm_config=vllm_config,
+                            executor_class=executor_class,
+                            log_stats=False,
+                            addresses=addresses,
+                            omni_master_server=self._omni_master_server,
+                            stage_id=metadata.stage_id,
+                        )
+                    else:
+                        addresses = get_engine_zmq_addresses(vllm_config)
+                        launch_cm = launch_core_engines(
+                            vllm_config=vllm_config,
+                            executor_class=executor_class,
+                            log_stats=False,
+                            addresses=addresses,
+                        )
                     engine_manager, coordinator, addresses = launch_cm.__enter__()
                     started_stage = StartedLlmStage(
                         stage_id=metadata.stage_id,
@@ -279,13 +293,68 @@ class AsyncOmniEngine:
             if lock_fds:
                 release_device_locks(lock_fds)
 
+    def _create_remote_llm_stage(
+        self,
+        stage_cfg: Any,
+        metadata: Any,
+        stage_connector_spec: dict[str, Any],
+        stage_init_timeout: int,
+        omni_master_server: OmniMasterServer,
+    ) -> StartedLlmStage:
+        """Wait for a remotely-launched engine-core to reach READY state.
+
+        Mirrors :meth:`_launch_llm_stage` but does **not** start any
+        subprocesses.  It binds the pre-allocated handshake ROUTER socket and
+        waits for the remote engine to complete the standard vLLM HELLO/READY
+        exchange before returning.
+        """
+        started_stage: StartedLlmStage | None = None
+        try:
+            engine_args_dict = build_engine_args_dict(
+                stage_cfg,
+                self.model,
+                stage_connector_spec=stage_connector_spec,
+            )
+            vllm_config, executor_class = build_vllm_config(
+                stage_cfg,
+                self.model,
+                stage_connector_spec=stage_connector_spec,
+                engine_args_dict=engine_args_dict,
+            )
+            addresses = omni_master_server.get_zmq_addresses(metadata.stage_id)
+            launch_cm = connect_remote_engine_cores(
+                vllm_config=vllm_config,
+                addresses=addresses,
+                omni_master_server=omni_master_server,
+                stage_id=metadata.stage_id,
+            )
+            engine_manager, coordinator, addresses = launch_cm.__enter__()
+            started_stage = StartedLlmStage(
+                stage_id=metadata.stage_id,
+                metadata=metadata,
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                engine_manager=engine_manager,
+                coordinator=coordinator,
+                addresses=addresses,
+            )
+            logger.info("[AsyncOmniEngine] Stage %s remote engine handshake started", metadata.stage_id)
+            launch_cm.__exit__(None, None, None)
+            logger.info("[AsyncOmniEngine] Stage %s remote engine startup completed", metadata.stage_id)
+            assert started_stage is not None
+            return started_stage
+        except Exception:
+            if started_stage is not None:
+                close_started_llm_stage(started_stage)
+            raise
+
     def _attach_llm_stage(
         self,
         started: StartedLlmStage,
     ) -> tuple[Any, Any, Any, InputProcessor | None]:
         """Attach a READY LLM stage to the orchestrator event loop."""
 
-        client_addresses = {
+        client_addresses: dict[str, str] = {
             "input_address": started.addresses.inputs[0],
             "output_address": started.addresses.outputs[0],
         }
@@ -357,6 +426,30 @@ class AsyncOmniEngine:
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self.model, self.config_path)
 
+        # ------------------------------------------------------------------ #
+        # Single-stage mode: start OmniMasterServer before launching stages.  #
+        # ------------------------------------------------------------------ #
+        if self.single_stage_mode:
+            if not self._omni_master_address or not self._omni_master_port:
+                raise ValueError(
+                    "AsyncOmniEngine single_stage_mode requires both "
+                    "omni_master_address and omni_master_port to be set."
+                )
+            # Collect all LLM stage IDs for pre-allocation.
+            all_llm_stage_ids = [
+                i for i, sc in enumerate(self.stage_configs) if getattr(sc, "stage_type", "llm") != "diffusion"
+            ]
+            self._omni_master_server = OmniMasterServer(
+                master_address=self._omni_master_address,
+                master_port=self._omni_master_port,
+                stage_ids=all_llm_stage_ids,
+            )
+            self._omni_master_server.start()
+            logger.info(
+                "[AsyncOmniEngine] OmniMasterServer started for stages %s",
+                all_llm_stage_ids,
+            )
+
         try:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max(1, llm_stage_count),
@@ -367,6 +460,9 @@ class AsyncOmniEngine:
                     metadata = extract_stage_metadata(stage_cfg)
                     if metadata.prompt_expand_func is not None:
                         prompt_expand_func = metadata.prompt_expand_func
+
+                    if self.single_stage_mode:
+                        metadata.runtime_cfg = None
 
                     stage_connector_spec = get_stage_connector_spec(
                         omni_transfer_config=omni_transfer_config,
@@ -389,28 +485,56 @@ class AsyncOmniEngine:
                         continue
 
                     llm_stage_ids.append(stage_id)
-                    llm_launch_futures[stage_id] = launch_executor.submit(
-                        self._launch_llm_stage,
-                        stage_cfg,
-                        metadata,
-                        stage_connector_spec,
-                        stage_init_timeout,
-                        omni_kv_connector,
-                    )
+
+                    # In single-stage mode, stages that don't match the local
+                    # stage_id filter are skipped.
+                    if (
+                        self.single_stage_mode
+                        and self._single_stage_id_filter is not None
+                        and stage_id != self._single_stage_id_filter
+                    ):
+                        assert self._omni_master_server is not None
+                        llm_launch_futures[stage_id] = launch_executor.submit(
+                            self._create_remote_llm_stage,
+                            stage_cfg,
+                            metadata,
+                            stage_connector_spec,
+                            stage_init_timeout,
+                            self._omni_master_server,
+                        )
+                    else:
+                        llm_launch_futures[stage_id] = launch_executor.submit(
+                            self._launch_llm_stage,
+                            stage_cfg,
+                            metadata,
+                            stage_connector_spec,
+                            stage_init_timeout,
+                            omni_kv_connector,
+                        )
 
                 concurrent.futures.wait(list(llm_launch_futures.values()))
 
                 for stage_id in llm_stage_ids:
                     started_llm_stages[stage_id] = llm_launch_futures[stage_id].result()
 
-            for stage_id in llm_stage_ids:
-                started = started_llm_stages[stage_id]
-                stage_client, output_processor, vllm_config, stage0_input_processor = self._attach_llm_stage(started)
-                stage_clients[stage_id] = stage_client
-                output_processors[stage_id] = output_processor
-                stage_vllm_configs[stage_id] = vllm_config
-                if stage0_input_processor is not None:
-                    input_processor = stage0_input_processor
+            attach_futures: dict[concurrent.futures.Future[tuple[Any, Any, Any, InputProcessor | None]], int] = {}
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, len(llm_stage_ids)),
+                thread_name_prefix="llm-stage-attach",
+            ) as attach_executor:
+                for stage_id in llm_stage_ids:
+                    attach_futures[attach_executor.submit(self._attach_llm_stage, started_llm_stages[stage_id])] = (
+                        stage_id
+                    )
+
+                for future in concurrent.futures.as_completed(attach_futures):
+                    stage_id = attach_futures[future]
+                    stage_client, output_processor, vllm_config, stage0_input_processor = future.result()
+                    stage_clients[stage_id] = stage_client
+                    output_processors[stage_id] = output_processor
+                    stage_vllm_configs[stage_id] = vllm_config
+                    if stage0_input_processor is not None:
+                        input_processor = stage0_input_processor
 
             initialized_stage_clients, default_sampling_params_list, stage_metadata = finalize_initialized_stages(
                 stage_clients,
@@ -429,6 +553,11 @@ class AsyncOmniEngine:
                 stage_clients,
                 [started_llm_stages[stage_id] for stage_id in llm_stage_ids if stage_id in started_llm_stages],
             )
+            if self._omni_master_server is not None:
+                try:
+                    self._omni_master_server.stop()
+                except Exception:
+                    logger.exception("[AsyncOmniEngine] Failed to stop OmniMasterServer during stage-init cleanup")
             raise
 
         self.stage_clients = initialized_stage_clients
@@ -516,7 +645,8 @@ class AsyncOmniEngine:
         model: str,
         engine_args: OmniEngineArgs | None = None,
         stage_init_timeout: int = 300,
-        init_timeout: int = 600,
+        init_timeout: int = 300,
+        single_stage_mode: bool = False,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -534,6 +664,31 @@ class AsyncOmniEngine:
             # Remove model since it is passed as a positional arg already.
             ea_dict.pop("model", None)
             kwargs = {**ea_dict, **kwargs}
+
+        # ------------------------------------------------------------------ #
+        # Single-stage mode detection                                          #
+        # ------------------------------------------------------------------ #
+        # Single-stage mode is enabled when the caller explicitly passes       #
+        # single_stage_mode=True, OR when a stage_id is provided in the args. #
+        _stage_id_kwarg = kwargs.get("stage_id")
+        if isinstance(_stage_id_kwarg, int) and not single_stage_mode:
+            single_stage_mode = True
+
+        self.single_stage_mode: bool = single_stage_mode
+        self._single_stage_id_filter: int | None = (
+            int(_stage_id_kwarg) if single_stage_mode and isinstance(_stage_id_kwarg, int) else None
+        )
+        self._omni_master_address: str | None = kwargs.get("omni_master_address")
+        self._omni_master_port: int | None = kwargs.get("omni_master_port")
+        self._omni_master_server: OmniMasterServer | None = None
+
+        if single_stage_mode:
+            logger.info(
+                "[AsyncOmniEngine] Single-stage mode enabled (stage_id_filter=%s, master=%s:%s)",
+                self._single_stage_id_filter,
+                self._omni_master_address,
+                self._omni_master_port,
+            )
 
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
@@ -1100,3 +1255,10 @@ class AsyncOmniEngine:
                 q.close()
             except Exception:
                 pass
+
+        if self._omni_master_server is not None:
+            try:
+                self._omni_master_server.stop()
+            except Exception:
+                logger.exception("[AsyncOmniEngine] Failed to stop OmniMasterServer during shutdown")
+            self._omni_master_server = None

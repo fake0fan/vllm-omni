@@ -53,7 +53,11 @@ class OmniEngineArgs(EngineArgs):
     Adds omni-specific configuration fields for multi-stage pipeline
     processing and output type specification.
     Args:
-        stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
+        stage_id: Identifier for the stage in a multi-stage pipeline.
+            When specified (not None), **single-stage mode** is enabled and
+            AsyncOmniEngine will only start the engine whose stage_id matches
+            this value; all other stages wait for remote engines to register.
+            When None (default), the classical multi-stage mode is used.
         model_stage: Stage type identifier, e.g., "thinker" or "talker"
             (default: "thinker")
         model_arch: Model architecture name
@@ -69,9 +73,21 @@ class OmniEngineArgs(EngineArgs):
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
             If not specified, will be inferred from model path.
+        omni_master_address: TCP address that the OmniMasterServer (running
+            inside AsyncOmniEngine) listens on for engine core registrations.
+            Required when single-stage mode is active.
+        omni_master_port: TCP port for the OmniMasterServer registration
+            socket.  Required when single-stage mode is active.
+        stage_configs_path: Optional path to a JSON/YAML file containing
+            stage configurations for the multi-stage pipeline. If None,
+            stage configs are resolved from the model's default configuration.
+        output_modalities: Optional list of output modality names to enable
+            (e.g. ["text", "audio"]). If None, all modalities supported by
+            the model are used.
+        log_stats: Whether to log engine statistics. Defaults to True.
     """
 
-    stage_id: int = 0
+    stage_id: int | None = None
     model_stage: str = "thinker"
     model_arch: str | None = None
     engine_output_type: str | None = None
@@ -83,6 +99,11 @@ class OmniEngineArgs(EngineArgs):
     quantization_config: Any | None = None
     worker_type: str | None = None
     task_type: str | None = None
+    omni_master_address: str | None = None
+    omni_master_port: int | None = None
+    stage_configs_path: str | None = None
+    output_modalities: list[str] | None = None
+    log_stats: bool = True
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()
@@ -138,12 +159,16 @@ class OmniEngineArgs(EngineArgs):
         mm_encoder_attn_backend = getattr(self, "mm_encoder_attn_backend", None)
         video_pruning_rate = getattr(self, "video_pruning_rate", 0.0)
 
+        # Resolve effective stage_id (None means multi-stage mode; default to 0
+        # for model-config purposes so downstream code always sees an int).
+        _effective_stage_id: int = self.stage_id if self.stage_id is not None else 0
+
         # Build stage_connector_config from stage_connector_spec
         stage_connector_config = {
             "name": self.stage_connector_spec.get("name", "SharedMemoryConnector"),
             "extra": self.stage_connector_spec.get("extra", {}).copy(),
         }
-        stage_connector_config["extra"]["stage_id"] = self.stage_id
+        stage_connector_config["extra"]["stage_id"] = _effective_stage_id
 
         # Create OmniModelConfig directly from engine args
         # Note: We pass the actual init parameters matching vLLM's EngineArgs.create_model_config()
@@ -202,7 +227,7 @@ class OmniEngineArgs(EngineArgs):
             video_pruning_rate=video_pruning_rate,
             io_processor_plugin=self.io_processor_plugin,
             # Omni-specific fields
-            stage_id=self.stage_id,
+            stage_id=_effective_stage_id,
             async_chunk=self.async_chunk,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
