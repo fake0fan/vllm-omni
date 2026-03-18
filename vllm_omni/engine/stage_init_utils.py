@@ -31,6 +31,49 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 logger = init_logger(__name__)
 
 
+def _resolve_model_to_local_path(model: str) -> str:
+    """Resolve an HF Hub model ID to a local cache path."""
+    if os.path.isdir(model):
+        return model
+
+    try:
+        from huggingface_hub import snapshot_download
+
+        # Keep init path resolution offline-friendly.
+        return snapshot_download(model, local_files_only=True)
+    except Exception:
+        logger.warning(
+            "[stage_init] Could not resolve %s to local snapshot; using as-is",
+            model,
+        )
+        return model
+
+
+def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> str:
+    """Apply model_subdir/tokenizer_subdir indirections from stage engine args."""
+    model_subdir = engine_args.pop("model_subdir", None)
+    tokenizer_subdir = engine_args.pop("tokenizer_subdir", None)
+    if model_subdir is None and tokenizer_subdir is None:
+        return model
+
+    resolved_base = _resolve_model_to_local_path(model)
+
+    if model_subdir:
+        model = os.path.join(resolved_base, model_subdir)
+        logger.info("[stage_init] Using model subdirectory: %s", model)
+
+    if tokenizer_subdir is not None:
+        tokenizer_path = os.path.join(resolved_base, tokenizer_subdir) if tokenizer_subdir else resolved_base
+        engine_args["tokenizer"] = tokenizer_path
+        logger.info("[stage_init] Using tokenizer from: %s", tokenizer_path)
+    elif model_subdir and "tokenizer" not in engine_args:
+        # Keep legacy behavior: model in subdir, tokenizer defaults to base path.
+        engine_args["tokenizer"] = resolved_base
+        logger.info("[stage_init] Using tokenizer from base model path: %s", resolved_base)
+
+    return model
+
+
 def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
     """Resolve worker_cls from worker_type for non-diffusion stages."""
     worker_type = engine_args.get("worker_type", None)
@@ -67,6 +110,8 @@ class StageMetadata:
     custom_process_input_func: Callable | None
     model_stage: str | None
     runtime_cfg: Any
+    prompt_expand_func: Callable | None = None
+    cfg_kv_collect_func: Callable | None = None
 
 
 @dataclass
@@ -101,6 +146,18 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         mod_path, fn_name = stage_config.custom_process_input_func.rsplit(".", 1)
         custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
 
+    prompt_expand_func: Callable | None = None
+    _pef_path = getattr(stage_config, "prompt_expand_func", None)
+    if _pef_path:
+        _mod, _fn = _pef_path.rsplit(".", 1)
+        prompt_expand_func = getattr(importlib.import_module(_mod), _fn)
+
+    cfg_kv_collect_func: Callable | None = None
+    _ckf_path = getattr(stage_config, "cfg_kv_collect_func", None)
+    if _ckf_path:
+        _mod, _fn = _ckf_path.rsplit(".", 1)
+        cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
+
     if stage_type == "diffusion":
         return StageMetadata(
             stage_id=stage_id,
@@ -115,6 +172,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             custom_process_input_func=custom_process_input_func,
             model_stage=None,
             runtime_cfg=runtime_cfg,
+            cfg_kv_collect_func=cfg_kv_collect_func,
         )
 
     model_stage = getattr(engine_args, "model_stage", None)
@@ -135,6 +193,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         custom_process_input_func=custom_process_input_func,
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
+        prompt_expand_func=prompt_expand_func,
     )
 
 
@@ -185,6 +244,7 @@ def build_engine_args_dict(
     stage_id = stage_config.stage_id
 
     engine_args_dict = _to_dict(engine_args)
+    model = _resolve_model_tokenizer_paths(model, engine_args_dict)
     engine_args_dict["model"] = model
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
@@ -390,6 +450,8 @@ def initialize_diffusion_stage(model: str, stage_cfg: Any, metadata: StageMetada
         model=model,
         **_to_dict(stage_cfg.engine_args),
     )
+    if metadata.cfg_kv_collect_func is not None:
+        od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
     return StageDiffusionClient(model, od_config, metadata)
 
 
