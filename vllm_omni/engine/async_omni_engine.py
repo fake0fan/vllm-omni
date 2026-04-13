@@ -441,9 +441,7 @@ class AsyncOmniEngine:
                 else:
                     assert proc is not None
                     assert handshake_address is not None
-                    complete_stage_handshake(
-                        proc, handshake_address, addresses, vllm_config, stage_init_timeout
-                    )
+                    complete_stage_handshake(proc, handshake_address, addresses, vllm_config, stage_init_timeout)
                 logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
 
             assert started_stage is not None
