@@ -409,3 +409,40 @@ def test_build_stage_runtimes_wires_entry_input_processor_only_to_entry_runtime(
     assert runtimes[0].supported_tasks == ("generate",)
     assert runtimes[1].input_processor is input_processor
     assert runtimes[1].supported_tasks == ("generate", "speech")
+
+
+@pytest.mark.asyncio
+async def test_build_stage_runtimes_keeps_diffusion_entry_runtime_constructible() -> None:
+    diffusion_client = _FakeStageClient(stage_id=3, stage_type="diffusion", final_output=True)
+    input_processor = object()
+
+    runtimes = build_stage_runtimes(
+        stage_clients=[diffusion_client],
+        output_processors=[None],
+        stage_vllm_configs=[None],
+        entry_stage_id=3,
+        entry_input_processor=input_processor,
+        supported_tasks=("generate", "speech"),
+    )
+
+    assert isinstance(runtimes[0], DiffusionStageRuntime)
+    assert runtimes[0].stage_id == 3
+
+    meta = RequestMeta(
+        request_id="req-diffusion-entry",
+        final_stage_id=3,
+        sampling_params_list=[SimpleNamespace(scale=1.0)],
+        prompt_text=None,
+        arrival_time=None,
+        lora_request=None,
+        tokenization_kwargs=None,
+        trace_headers=None,
+        priority=0,
+        data_parallel_rank=None,
+        reasoning_ended=None,
+        resumable=False,
+    )
+    data = PipelineData(raw_prompt={"prompt": "diffusion entry"}, stage0_request=None, terminal_outputs={})
+
+    submitted = await runtimes[0].accept_external_request(meta=meta, data=data)
+    assert submitted == {"prompt": "diffusion entry"}

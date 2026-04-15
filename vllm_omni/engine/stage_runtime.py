@@ -235,7 +235,7 @@ def build_stage_runtimes(
         else:
             raise ValueError(f"Unknown stage_type: {stage_client.stage_type!r}")
         runtime_kwargs: dict[str, Any] = {}
-        if stage_client.stage_id == entry_stage_id:
+        if runtime_cls is LLMStageRuntime and stage_client.stage_id == entry_stage_id:
             runtime_kwargs["input_processor"] = entry_input_processor
             runtime_kwargs["supported_tasks"] = supported_tasks
         runtimes.append(
