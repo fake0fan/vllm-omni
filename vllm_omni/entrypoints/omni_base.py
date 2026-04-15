@@ -206,7 +206,22 @@ class OmniBase:
             return True, None, None, None
 
         if msg_type == "error":
-            raise RuntimeError(msg.get("error", "Orchestrator returned an error message"))
+            req_id = msg.get("request_id")
+            if req_id is None:
+                raise RuntimeError(msg.get("error", "Orchestrator returned an error message"))
+
+            stage_id = msg.get("stage_id", 0)
+            req_state = self.request_states.get(req_id)
+            if req_state is None:
+                logger.debug(
+                    "[%s] dropping scoped error for unknown req %s",
+                    self.__class__.__name__,
+                    req_id,
+                )
+                return True, None, None, None
+
+            req_state.stage_id = stage_id
+            return False, req_id, stage_id, req_state
 
         if msg_type != "output":
             logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg_type)

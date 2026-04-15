@@ -324,6 +324,21 @@ def _enqueue_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> 
     )
 
 
+def _enqueue_request_scoped_error_or_success(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    if msg["request_id"] == "req-fail":
+        engine.output_q.put_nowait(
+            {
+                "type": "error",
+                "request_id": "req-fail",
+                "stage_id": 0,
+                "error": "entry failure",
+            }
+        )
+        return
+
+    _enqueue_async_finish_outputs(engine, msg)
+
+
 @pytest.mark.asyncio
 async def test_get_supported_tasks_returns_engine_supported_tasks():
     omni = object.__new__(AsyncOmni)
@@ -663,6 +678,56 @@ def test_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
 
     assert engine.aborted == [["req-1"]]
     assert "req-1" not in app.request_states
+
+
+def test_omni_request_scoped_error_raises_explicit_runtime_error(monkeypatch: pytest.MonkeyPatch):
+    sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        default_sampling_params_list=sampling_params,
+        on_add_request=_enqueue_error_message,
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    try:
+        with pytest.raises(RuntimeError, match="engine boom"):
+            list(app.generate(["p1"], py_generator=True, use_tqdm=False))
+    finally:
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_async_omni_request_scoped_error_does_not_poison_other_requests(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_request_scoped_error_or_success)
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+
+    async def _consume_failure() -> None:
+        with pytest.raises(RuntimeError, match="entry failure"):
+            async for _ in app.generate(prompt="bad", request_id="req-fail"):
+                pass
+
+    async def _consume_success() -> list[Any]:
+        outputs = []
+        async for output in app.generate(prompt="good", request_id="req-ok"):
+            outputs.append(output)
+        return outputs
+
+    try:
+        failure_task = asyncio.create_task(_consume_failure())
+        success_task = asyncio.create_task(_consume_success())
+        success_outputs = await success_task
+        await failure_task
+    finally:
+        app.shutdown()
+
+    assert [output.request_output.payload for output in success_outputs] == [
+        "req-ok-stage0",
+        "req-ok-stage2-final",
+    ]
+    assert "req-ok" not in app.request_states
 
 
 def test_omni_forces_final_only_on_llm_stages(monkeypatch: pytest.MonkeyPatch):

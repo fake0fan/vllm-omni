@@ -49,6 +49,7 @@ class FakeStageClient:
         self.next_inputs = list(next_inputs or [])
         self.custom_process_input_func = None
         self.add_request_calls: list[tuple] = []
+        self.process_engine_inputs_calls: list[dict[str, Any]] = []
         self.abort_calls: list[list[str]] = []
         self.shutdown_calls = 0
         self._engine_core_outputs = queue.Queue()
@@ -77,6 +78,12 @@ class FakeStageClient:
         return None
 
     def process_engine_inputs(self, stage_list, prompt=None):
+        self.process_engine_inputs_calls.append(
+            {
+                "stage_list": stage_list,
+                "prompt": prompt,
+            }
+        )
         return list(self.next_inputs)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -307,6 +314,27 @@ async def _enqueue_abort_request(orchestrator_fixture: OrchestratorFixture, requ
     )
 
 
+async def _enqueue_streaming_update(
+    orchestrator_fixture: OrchestratorFixture,
+    *,
+    request_id: str,
+    prompt,
+    original_prompt,
+    sampling_params_list,
+    final_stage_id: int,
+) -> None:
+    orchestrator_fixture.request_sync_q.put_nowait(
+        {
+            "type": "streaming_update",
+            "request_id": request_id,
+            "prompt": prompt,
+            "original_prompt": original_prompt,
+            "sampling_params_list": sampling_params_list,
+            "final_stage_id": final_stage_id,
+        }
+    )
+
+
 @pytest.fixture
 def orchestrator_factory():
     fixtures: list[OrchestratorFixture] = []
@@ -432,6 +460,82 @@ async def test_run_two_stage_llm_entry_runtime_processes_raw_prompt(orchestrator
         assert output_msg["finished"] is True
         assert output_msg["engine_outputs"].request_id == "req-entry"
         assert "req-entry" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_streaming_update_raw_prompt_reprocesses_entry_runtime_and_updates_downstream_prompt(
+    orchestrator_factory,
+) -> None:
+    stage0 = FakeStageClient(stage_id=7, stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(
+        stage_id=11,
+        stage_type="llm",
+        final_output=True,
+        next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
+    )
+    processors = [
+        FakeOutputProcessor(
+            request_outputs=[_build_request_output("req-stream-entry", token_ids=[3, 4], finished=True)]
+        ),
+        FakeOutputProcessor(
+            request_outputs=[_build_request_output("req-stream-entry", token_ids=[10, 11], finished=True)]
+        ),
+    ]
+    entry_input_processor = FakeInputProcessor(_engine_core_request("prepared-stream-entry", [1, 2, 3]))
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=processors,
+        entry_input_processor=entry_input_processor,
+        supported_tasks=("generate",),
+    )
+    initial_raw_prompt = {"prompt": "hello raw"}
+    updated_raw_prompt = {"prompt": "updated raw"}
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-stream-entry",
+            prompt=initial_raw_prompt,
+            original_prompt=initial_raw_prompt,
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+
+        await _enqueue_streaming_update(
+            orchestrator_fixture,
+            request_id="req-stream-entry",
+            prompt=updated_raw_prompt,
+            original_prompt=updated_raw_prompt,
+            sampling_params_list=[_sampling_params(max_tokens=6), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage0.add_request_calls) == 2)
+        assert entry_input_processor.calls[0]["prompt"] == initial_raw_prompt
+        assert entry_input_processor.calls[1]["prompt"] == updated_raw_prompt
+        updated_stage0_request = stage0.add_request_calls[1][0]
+        assert isinstance(updated_stage0_request, EngineCoreRequest)
+        assert updated_stage0_request.external_req_id == "req-stream-entry"
+
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        assert stage1.process_engine_inputs_calls[0]["prompt"] == updated_raw_prompt
+        stage1_request = stage1.add_request_calls[0][0]
+        assert stage1_request.request_id == "req-stream-entry"
+        assert stage1_request.prompt_token_ids == [7, 8, 9]
+
+        stage1.push_engine_core_outputs(_engine_core_outputs("stage1-raw", 2.0))
+
+        output_msg = await _get_output_message(orchestrator_fixture)
+
+        assert output_msg["request_id"] == "req-stream-entry"
+        assert output_msg["stage_id"] == 1
+        assert output_msg["finished"] is True
+        assert "req-stream-entry" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 

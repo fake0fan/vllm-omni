@@ -570,6 +570,41 @@ class PipelineRuntime:
 
         req_state.mark_stage_submitted(next_stage_id, _time.time())
 
+    async def _emit_request_error(self, request_id: str, error: Exception) -> None:
+        stage_id = self.entry_stage_pos if self.entry_stage_pos is not None else 0
+        await self.output_async_queue.put(
+            {
+                "type": "error",
+                "request_id": request_id,
+                "stage_id": stage_id,
+                "error": str(error),
+            }
+        )
+
+    async def _cleanup_failed_entry_request(self, request_id: str) -> None:
+        req_state = self.request_states.pop(request_id, None)
+        if req_state is not None:
+            req_state.cancel()
+        self._cleanup_companion_state(request_id)
+
+        for runtime in self.stage_runtimes:
+            try:
+                await runtime.abort([request_id])
+            except Exception:
+                logger.exception(
+                    "[Orchestrator] abort failed while cleaning up req=%s after entry failure",
+                    request_id,
+                )
+
+    async def _handle_entry_request_error(self, request_id: str, error: Exception) -> None:
+        logger.exception(
+            "[Orchestrator] Entry ingress failed for req=%s at stage=%s",
+            request_id,
+            self.entry_stage_pos,
+        )
+        await self._cleanup_failed_entry_request(request_id)
+        await self._emit_request_error(request_id, error)
+
     async def _handle_add_request(self, msg: dict[str, Any]) -> None:
         """Handle an add_request message from the main thread."""
         if self.entry_runtime is None or self.entry_stage_pos is None:
@@ -619,10 +654,14 @@ class PipelineRuntime:
         req_state.mark_stage_submitted(self.entry_stage_pos, _time.time())
         self.request_states[request_id] = req_state
 
-        stage0_request = await self.entry_runtime.accept_external_request(
-            meta=req_state.meta,
-            data=req_state.data,
-        )
+        try:
+            stage0_request = await self.entry_runtime.accept_external_request(
+                meta=req_state.meta,
+                data=req_state.data,
+            )
+        except Exception as error:
+            await self._handle_entry_request_error(request_id, error)
+            return
 
         if self.async_chunk and final_stage_id > self.entry_stage_pos:
             await self._prewarm_async_chunk_stages(request_id, stage0_request, req_state)
@@ -654,10 +693,13 @@ class PipelineRuntime:
             req_state.meta.sampling_params_list = msg["sampling_params_list"]
 
         req_state.mark_stage_submitted(self.entry_stage_pos, _time.time())
-        await self.entry_runtime.accept_streaming_update(
-            meta=req_state.meta,
-            data=req_state.data,
-        )
+        try:
+            await self.entry_runtime.accept_streaming_update(
+                meta=req_state.meta,
+                data=req_state.data,
+            )
+        except Exception as error:
+            await self._handle_entry_request_error(request_id, error)
 
     async def _prewarm_async_chunk_stages(
         self,

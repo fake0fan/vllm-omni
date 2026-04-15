@@ -152,6 +152,11 @@ class Omni(OmniBase):
                     logger.warning("[Omni] Received output for unknown/finished request_id=%s", req_id)
                     continue
 
+                if "error" in msg:
+                    active_reqs.discard(req_id)
+                    self._log_summary_and_cleanup(req_id)
+                    raise RuntimeError(f"Request {req_id} failed: {msg['error']}")
+
                 if req_state.metrics is None:
                     continue
                 output_to_yield = self._process_single_result(
