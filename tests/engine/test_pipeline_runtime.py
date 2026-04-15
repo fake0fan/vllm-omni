@@ -12,6 +12,7 @@ from vllm_omni.engine.orchestrator import (
 from vllm_omni.engine.pipeline_runtime import (
     PipelineRequestState,
     PipelineRuntime,
+    _accept_prebuilt_llm_entry_request,
     build_engine_core_request_from_tokens,
 )
 from vllm_omni.engine.pipeline_state import PipelineData, RequestMeta
@@ -64,7 +65,7 @@ def test_streaming_update_preserves_original_prompt_for_prebuilt_entry_requests(
         )
     }
 
-    new_prebuilt_request = SimpleNamespace(request_id="new-prebuilt")
+    new_prebuilt_request = _make_engine_core_request("new-prebuilt")
     new_raw_prompt = {"prompt": "new raw"}
 
     asyncio.run(
@@ -86,6 +87,74 @@ def test_streaming_update_preserves_original_prompt_for_prebuilt_entry_requests(
     assert req_state.stage_submit_ts[0] > 0
     assert observed["meta"] is req_state.meta
     assert observed["data"] is req_state.data
+
+
+def test_add_request_rejects_raw_prompt_when_entry_runtime_requires_prebuilt_requests() -> None:
+    runtime = object.__new__(PipelineRuntime)
+    output_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    submit_calls: list[dict[str, object]] = []
+    abort_calls: list[list[str]] = []
+
+    async def _submit(*, request, request_id, params):
+        submit_calls.append(
+            {
+                "request": request,
+                "request_id": request_id,
+                "params": params,
+            }
+        )
+
+    async def _abort(request_ids):
+        abort_calls.append(list(request_ids))
+
+    entry_runtime = SimpleNamespace(
+        stage_id=2,
+        stage_type="llm",
+        output_processor=None,
+        submit=_submit,
+        abort=_abort,
+    )
+    entry_runtime.accept_external_request = _accept_prebuilt_llm_entry_request.__get__(
+        entry_runtime,
+        type(entry_runtime),
+    )
+
+    runtime.output_async_queue = output_queue
+    runtime.entry_runtime = entry_runtime
+    runtime.entry_stage_pos = 0
+    runtime.entry_stage_id = 2
+    runtime._entry_uses_prebuilt_request = True
+    runtime.request_states = {}
+    runtime.stage_runtimes = [entry_runtime]
+    runtime._companion_map = {}
+    runtime._companion_ids = set()
+    runtime._companion_to_parent = {}
+    runtime._companion_done = {}
+    runtime._deferred_parents = {}
+    runtime.async_chunk = False
+
+    asyncio.run(
+        PipelineRuntime._handle_add_request(
+            runtime,
+            {
+                "request_id": "req-raw",
+                "prompt": {"prompt": "raw prompt"},
+                "original_prompt": {"prompt": "raw prompt"},
+                "sampling_params_list": [SamplingParams(max_tokens=4)],
+                "final_stage_id": 0,
+            },
+        )
+    )
+
+    assert submit_calls == []
+    assert abort_calls == [["req-raw"]]
+    assert runtime.request_states == {}
+    assert output_queue.get_nowait() == {
+        "type": "error",
+        "request_id": "req-raw",
+        "stage_id": 0,
+        "error": "Prebuilt entry runtime requires EngineCoreRequest prompts, got dict",
+    }
 
 
 def test_add_request_entry_failure_emits_request_scoped_error_and_keeps_runtime_alive() -> None:
@@ -179,6 +248,89 @@ def test_add_request_preserves_prebuilt_entry_request_even_with_input_processor_
     assert observed["data"].raw_prompt is request
     assert req_state.data.stage0_request is request
     assert req_state.stage_submit_ts[0] > 0
+
+
+def test_add_request_cleans_up_parent_when_prebuilt_entry_cfg_companion_is_raw_prompt() -> None:
+    runtime = object.__new__(PipelineRuntime)
+    output_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    submit_calls: list[dict[str, object]] = []
+    abort_calls: list[list[str]] = []
+
+    async def _submit(*, request, request_id, params):
+        submit_calls.append(
+            {
+                "request": request,
+                "request_id": request_id,
+                "params": params,
+            }
+        )
+
+    async def _abort(request_ids):
+        abort_calls.append(list(request_ids))
+
+    entry_runtime = SimpleNamespace(
+        stage_id=2,
+        stage_type="llm",
+        output_processor=None,
+        submit=_submit,
+        abort=_abort,
+    )
+    entry_runtime.accept_external_request = _accept_prebuilt_llm_entry_request.__get__(
+        entry_runtime,
+        type(entry_runtime),
+    )
+
+    stage0_params = SamplingParams(max_tokens=8, temperature=0.9)
+    downstream_params = SamplingParams(max_tokens=16)
+    parent_request = _make_engine_core_request("req-parent")
+    expansion = SimpleNamespace(
+        request_id_suffix="-neg",
+        prompt={"prompt": "negative prompt"},
+        role="negative",
+        apply_overrides=lambda entry_params, sampling_params_list: (entry_params, list(sampling_params_list)),
+    )
+
+    runtime.output_async_queue = output_queue
+    runtime.entry_runtime = entry_runtime
+    runtime.entry_stage_pos = 0
+    runtime.entry_stage_id = 2
+    runtime._entry_uses_prebuilt_request = True
+    runtime.prompt_expand_func = lambda prompt, entry_params: [expansion]
+    runtime.request_states = {}
+    runtime.stage_runtimes = [entry_runtime]
+    runtime._companion_map = {}
+    runtime._companion_ids = set()
+    runtime._companion_to_parent = {}
+    runtime._companion_done = {}
+    runtime._deferred_parents = {}
+    runtime.async_chunk = False
+
+    asyncio.run(
+        PipelineRuntime._handle_add_request(
+            runtime,
+            {
+                "request_id": "req-parent",
+                "prompt": parent_request,
+                "original_prompt": {"prompt": "parent prompt"},
+                "sampling_params_list": [stage0_params, downstream_params],
+                "final_stage_id": 1,
+            },
+        )
+    )
+
+    assert [call["request_id"] for call in submit_calls] == ["req-parent"]
+    assert abort_calls == [["req-parent", "req-parent-neg"]]
+    assert runtime.request_states == {}
+    assert runtime._companion_map == {}
+    assert runtime._companion_ids == set()
+    assert runtime._companion_to_parent == {}
+    assert runtime._companion_done == {}
+    assert output_queue.get_nowait() == {
+        "type": "error",
+        "request_id": "req-parent",
+        "stage_id": 0,
+        "error": "Prebuilt entry runtime requires EngineCoreRequest prompts, got dict",
+    }
 
 
 def test_add_companion_drops_message_when_parent_request_is_already_gone() -> None:

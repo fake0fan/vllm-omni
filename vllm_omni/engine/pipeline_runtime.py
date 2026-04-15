@@ -36,7 +36,7 @@ logger = init_logger(__name__)
 
 
 def _uses_prebuilt_stage0_request(prompt: Any, *, entry_uses_prebuilt_request: bool) -> bool:
-    return isinstance(prompt, EngineCoreRequest) or entry_uses_prebuilt_request
+    return isinstance(prompt, EngineCoreRequest)
 
 
 def _clone_prompt_for_runtime_ownership(prompt: Any) -> Any:
@@ -73,6 +73,10 @@ async def _accept_prebuilt_llm_entry_request(
     data: PipelineData,
 ) -> Any:
     request = data.stage0_request if data.stage0_request is not None else data.raw_prompt
+    if not isinstance(request, EngineCoreRequest):
+        raise TypeError(
+            f"Prebuilt entry runtime requires EngineCoreRequest prompts, got {type(request).__name__}"
+        )
     data.stage0_request = request
     if isinstance(request, EngineCoreRequest):
         register_stage0_output(
