@@ -21,9 +21,20 @@ class _DummySenderStage:
     def __init__(self, sender_info):
         self._sender_info = sender_info
         self.engine_outputs = None
+        self.calls = []
 
     def set_engine_outputs(self, outputs):
         self.engine_outputs = outputs
+
+    async def submit(self, *, request, request_id, params, kv_sender_info=None):
+        self.calls.append(
+            {
+                "request": request,
+                "request_id": request_id,
+                "params": params,
+                "kv_sender_info": kv_sender_info,
+            }
+        )
 
     def get_kv_sender_info(self):
         return self._sender_info
@@ -66,6 +77,10 @@ class _DummyDiffusionStage:
 class _DummySubmitStage:
     def __init__(self):
         self.calls = []
+        self.engine_outputs = None
+
+    def set_engine_outputs(self, outputs):
+        self.engine_outputs = outputs
 
     async def submit(self, *, request, request_id, params, kv_sender_info=None):
         self.calls.append(
@@ -138,6 +153,51 @@ def test_streaming_update_mutates_meta_sampling_params_directly():
             "kv_sender_info": None,
         }
     ]
+
+
+def test_streaming_update_refreshes_prompt_used_by_downstream_forwarding():
+    orchestrator = object.__new__(Orchestrator)
+    sender_stage = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50151})
+    diffusion_stage = _DummyDiffusionStage(stage_id=1, engine_input_source=[0])
+
+    orchestrator.num_stages = 2
+    orchestrator.stage_runtimes = build_stage_runtimes(
+        stage_clients=[sender_stage, diffusion_stage],
+        output_processors=[SimpleNamespace(add_request=lambda **_kwargs: None), None],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)), None],
+    )
+    orchestrator.stage_clients = [runtime.stage_client for runtime in orchestrator.stage_runtimes]
+    orchestrator._companion_map = {}
+    orchestrator.stage_vllm_configs = [None, None]
+    orchestrator.output_processors = [None, None]
+
+    initial_prompt = {"prompt": "original"}
+    updated_prompt = {"prompt": "updated"}
+    req_state = _build_request_state(
+        request_id="req-forward",
+        prompt=initial_prompt,
+        sampling_params_list=[SamplingParams(max_tokens=4), SamplingParams(max_tokens=8)],
+        final_stage_id=1,
+    )
+    orchestrator.request_states["req-forward"] = req_state
+
+    asyncio.run(
+        Orchestrator._handle_streaming_update(
+            orchestrator,
+            {
+                "request_id": "req-forward",
+                "prompt": updated_prompt,
+                "sampling_params_list": [SamplingParams(max_tokens=4), SamplingParams(max_tokens=8)],
+            },
+        )
+    )
+
+    output = SimpleNamespace(request_id="req-forward", finished=True)
+    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-forward", 0, output, req_state))
+
+    assert req_state.data.raw_prompt == updated_prompt
+    assert req_state.data.stage0_request == updated_prompt
+    assert diffusion_stage.calls[0]["prompt"] == updated_prompt
 
 
 def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():

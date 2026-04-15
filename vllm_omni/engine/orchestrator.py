@@ -632,6 +632,8 @@ class Orchestrator:
             await self._handle_add_request(fallback_msg)
             return
 
+        req_state.data.raw_prompt = request
+        req_state.data.stage0_request = request
         if "sampling_params_list" in msg and msg["sampling_params_list"]:
             req_state.meta.sampling_params_list = msg["sampling_params_list"]
 
