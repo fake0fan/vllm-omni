@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
+
+from vllm_omni.engine.pipeline_state import PipelineData, RequestMeta
+from vllm_omni.engine.stage0_processing import (
+    prepare_stage0_llm_request,
+    register_stage0_output,
+)
 
 
 @dataclass
@@ -33,6 +39,14 @@ class StageRuntime(ABC):
             request_index=0,
             queue=None,
         )
+
+    async def accept_external_request(self, *, meta: RequestMeta, data: PipelineData) -> Any:
+        request = data.raw_prompt
+        await self.submit(request=request, request_id=meta.request_id, params=meta.entry_params)
+        return request
+
+    async def accept_streaming_update(self, *, meta: RequestMeta, data: PipelineData) -> Any:
+        return await self.accept_external_request(meta=meta, data=data)
 
     @abstractmethod
     async def submit(
@@ -84,7 +98,15 @@ class StageRuntime(ABC):
 
 
 class LLMStageRuntime(StageRuntime):
-    def __init__(self, *, stage_client: Any, output_processor: Any | None, stage_vllm_config: Any | None) -> None:
+    def __init__(
+        self,
+        *,
+        stage_client: Any,
+        output_processor: Any | None,
+        stage_vllm_config: Any | None,
+        input_processor: Any | None = None,
+        supported_tasks: Sequence[str] | None = None,
+    ) -> None:
         if output_processor is None:
             raise ValueError("LLMStageRuntime requires an output_processor")
         super().__init__(
@@ -92,6 +114,34 @@ class LLMStageRuntime(StageRuntime):
             output_processor=output_processor,
             stage_vllm_config=stage_vllm_config,
         )
+        self.input_processor = input_processor
+        self.supported_tasks = tuple(supported_tasks) if supported_tasks is not None else ("generate",)
+
+    async def _accept_stage0_request(self, *, meta: RequestMeta, data: PipelineData) -> Any:
+        if self.input_processor is None:
+            raise ValueError("LLMStageRuntime requires an input_processor for entry requests")
+
+        request = prepare_stage0_llm_request(
+            meta=meta,
+            data=data,
+            input_processor=self.input_processor,
+            supported_tasks=self.supported_tasks,
+        )
+        data.stage0_request = request
+        register_stage0_output(
+            self.output_processor,
+            request=request,
+            prompt_text=meta.prompt_text,
+            original_prompt=data.raw_prompt,
+        )
+        await self.submit(request=request, request_id=meta.request_id, params=meta.entry_params)
+        return request
+
+    async def accept_external_request(self, *, meta: RequestMeta, data: PipelineData) -> Any:
+        return await self._accept_stage0_request(meta=meta, data=data)
+
+    async def accept_streaming_update(self, *, meta: RequestMeta, data: PipelineData) -> Any:
+        return await self._accept_stage0_request(meta=meta, data=data)
 
     async def submit(
         self,
@@ -167,6 +217,9 @@ def build_stage_runtimes(
     stage_clients: list[Any],
     output_processors: list[Any | None],
     stage_vllm_configs: list[Any | None],
+    entry_stage_id: int | None = None,
+    entry_input_processor: Any | None = None,
+    supported_tasks: Sequence[str] | None = None,
 ) -> list[StageRuntime]:
     runtimes: list[StageRuntime] = []
     for stage_client, output_processor, stage_vllm_config in zip(
@@ -181,11 +234,16 @@ def build_stage_runtimes(
             runtime_cls = DiffusionStageRuntime
         else:
             raise ValueError(f"Unknown stage_type: {stage_client.stage_type!r}")
+        runtime_kwargs: dict[str, Any] = {}
+        if stage_client.stage_id == entry_stage_id:
+            runtime_kwargs["input_processor"] = entry_input_processor
+            runtime_kwargs["supported_tasks"] = supported_tasks
         runtimes.append(
             runtime_cls(
                 stage_client=stage_client,
                 output_processor=output_processor,
                 stage_vllm_config=stage_vllm_config,
+                **runtime_kwargs,
             )
         )
     return runtimes

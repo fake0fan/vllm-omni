@@ -1,7 +1,11 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest
 
+from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.pipeline_state import PipelineData, RequestMeta
 from vllm_omni.engine.stage_runtime import (
     DiffusionStageRuntime,
     LLMStageRuntime,
@@ -69,6 +73,30 @@ class _FakeOutputProcessor:
         self.scheduler_stats.append(scheduler_stats)
 
 
+class _FakeInputProcessor:
+    def __init__(self, request: EngineCoreRequest) -> None:
+        self.request = request
+        self.calls: list[dict[str, object]] = []
+
+    def process_inputs(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.request
+
+
+def _make_engine_core_request(request_id: str = "req-1") -> EngineCoreRequest:
+    return EngineCoreRequest(
+        request_id=request_id,
+        prompt_token_ids=[1, 1, 1],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_llm_stage_runtime_polls_outputs_and_forwards_abort() -> None:
     stage_client = _FakeStageClient(stage_id=0, stage_type="llm")
@@ -128,6 +156,101 @@ async def test_llm_stage_runtime_registers_request_before_submit() -> None:
     assert stage_client.add_request_calls[0][0] == (request,)
 
 
+@pytest.mark.asyncio
+async def test_llm_stage_runtime_accept_external_request_prepares_stage0_request() -> None:
+    stage_client = _FakeStageClient(stage_id=0, stage_type="llm")
+    processor = _FakeOutputProcessor()
+    prepared_request = _make_engine_core_request(request_id="base-req")
+    input_processor = _FakeInputProcessor(prepared_request)
+    runtime = LLMStageRuntime(
+        stage_client=stage_client,
+        output_processor=processor,
+        stage_vllm_config=None,
+        input_processor=input_processor,
+        supported_tasks=("generate", "speech"),
+    )
+    meta = RequestMeta(
+        request_id="req-entry",
+        final_stage_id=2,
+        sampling_params_list=[SamplingParams(max_tokens=8), SamplingParams(max_tokens=4)],
+        prompt_text="entry prompt",
+        arrival_time=1.5,
+        lora_request=None,
+        tokenization_kwargs={"trim": True},
+        trace_headers={"x-trace": "1"},
+        priority=3,
+        data_parallel_rank=7,
+        reasoning_ended=True,
+        resumable=False,
+    )
+    data = PipelineData(
+        raw_prompt={
+            "prompt": "raw prompt",
+            "additional_information": {"speaker": ["vivian"]},
+        },
+        stage0_request=None,
+        terminal_outputs={},
+    )
+
+    submitted = await runtime.accept_external_request(meta=meta, data=data)
+
+    assert isinstance(submitted, OmniEngineCoreRequest)
+    assert submitted is data.stage0_request
+    assert submitted.external_req_id == "req-entry"
+    assert submitted.reasoning_ended is True
+    assert processor.add_request_calls[0]["request"] is submitted
+    assert processor.add_request_calls[0]["prompt"] == "entry prompt"
+    assert stage_client.add_request_calls[0][0] == (submitted,)
+    assert input_processor.calls[0]["request_id"] == "req-entry"
+    assert input_processor.calls[0]["supported_tasks"] == ("generate", "speech")
+    assert input_processor.calls[0]["arrival_time"] == 1.5
+    assert input_processor.calls[0]["resumable"] is False
+    assert data.raw_prompt["additional_information"]["global_request_id"] == ["req-entry"]
+
+
+@pytest.mark.asyncio
+async def test_llm_stage_runtime_accept_streaming_update_uses_stage0_preprocessing() -> None:
+    stage_client = _FakeStageClient(stage_id=0, stage_type="llm")
+    processor = _FakeOutputProcessor()
+    prepared_request = _make_engine_core_request(request_id="base-stream")
+    input_processor = _FakeInputProcessor(prepared_request)
+    runtime = LLMStageRuntime(
+        stage_client=stage_client,
+        output_processor=processor,
+        stage_vllm_config=None,
+        input_processor=input_processor,
+        supported_tasks=("generate",),
+    )
+    meta = RequestMeta(
+        request_id="req-stream",
+        final_stage_id=1,
+        sampling_params_list=[SamplingParams(max_tokens=6)],
+        prompt_text=None,
+        arrival_time=None,
+        lora_request=None,
+        tokenization_kwargs=None,
+        trace_headers=None,
+        priority=0,
+        data_parallel_rank=None,
+        reasoning_ended=None,
+        resumable=True,
+    )
+    data = PipelineData(
+        raw_prompt={"prompt": "streaming prompt"},
+        stage0_request=None,
+        terminal_outputs={},
+    )
+
+    submitted = await runtime.accept_streaming_update(meta=meta, data=data)
+
+    assert submitted is data.stage0_request
+    assert isinstance(submitted, OmniEngineCoreRequest)
+    assert processor.add_request_calls[0]["prompt"] == "streaming prompt"
+    assert stage_client.add_request_calls[0][0] == (submitted,)
+    assert input_processor.calls[0]["resumable"] is True
+    assert input_processor.calls[0]["supported_tasks"] == ("generate",)
+
+
 def test_llm_stage_runtime_requires_output_processor() -> None:
     stage_client = _FakeStageClient(stage_id=1, stage_type="llm")
 
@@ -167,6 +290,35 @@ async def test_diffusion_stage_runtime_submit_forwards_single_request_contract()
     assert stage_client.add_request_calls[0][0] == ("req-img", request, params)
     assert stage_client.add_request_calls[0][1] == {"kv_sender_info": kv_sender_info}
     assert stage_client.add_batch_request_calls == []
+
+
+@pytest.mark.asyncio
+async def test_diffusion_stage_runtime_accept_external_request_passes_through_raw_prompt() -> None:
+    stage_client = _FakeStageClient(stage_id=2, stage_type="diffusion", final_output=True)
+    runtime = DiffusionStageRuntime(stage_client=stage_client, output_processor=None, stage_vllm_config=None)
+    params = SimpleNamespace(scale=1.5)
+    raw_prompt = [SimpleNamespace(prompt_token_ids=[1, 2, 3])]
+    meta = RequestMeta(
+        request_id="req-diffusion",
+        final_stage_id=2,
+        sampling_params_list=[params],
+        prompt_text=None,
+        arrival_time=None,
+        lora_request=None,
+        tokenization_kwargs=None,
+        trace_headers=None,
+        priority=0,
+        data_parallel_rank=None,
+        reasoning_ended=None,
+        resumable=False,
+    )
+    data = PipelineData(raw_prompt=raw_prompt, stage0_request=None, terminal_outputs={})
+
+    submitted = await runtime.accept_external_request(meta=meta, data=data)
+
+    assert submitted is raw_prompt
+    assert stage_client.add_batch_request_calls[0][0] == ("req-diffusion", raw_prompt, params)
+    assert stage_client.add_request_calls == []
 
 
 @pytest.mark.asyncio
@@ -235,3 +387,25 @@ def test_build_stage_runtimes_selects_runtime_type() -> None:
 
     assert isinstance(runtimes[0], LLMStageRuntime)
     assert isinstance(runtimes[1], DiffusionStageRuntime)
+
+
+def test_build_stage_runtimes_wires_entry_input_processor_only_to_entry_runtime() -> None:
+    llm_client_0 = _FakeStageClient(stage_id=1, stage_type="llm")
+    llm_client_1 = _FakeStageClient(stage_id=2, stage_type="llm")
+    input_processor = object()
+
+    runtimes = build_stage_runtimes(
+        stage_clients=[llm_client_0, llm_client_1],
+        output_processors=[_FakeOutputProcessor(), _FakeOutputProcessor()],
+        stage_vllm_configs=[SimpleNamespace(), SimpleNamespace()],
+        entry_stage_id=2,
+        entry_input_processor=input_processor,
+        supported_tasks=("generate", "speech"),
+    )
+
+    assert isinstance(runtimes[0], LLMStageRuntime)
+    assert isinstance(runtimes[1], LLMStageRuntime)
+    assert runtimes[0].input_processor is None
+    assert runtimes[0].supported_tasks == ("generate",)
+    assert runtimes[1].input_processor is input_processor
+    assert runtimes[1].supported_tasks == ("generate", "speech")

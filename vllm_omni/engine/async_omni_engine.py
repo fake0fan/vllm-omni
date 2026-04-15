@@ -41,13 +41,9 @@ from vllm_omni.diffusion.stage_diffusion_proc import (
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
-from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
-from vllm_omni.engine.serialization import (
-    deserialize_additional_information,
-    serialize_additional_information,
-)
+from vllm_omni.engine import stage0_processing
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_core_proc import (
     complete_stage_handshake,
@@ -100,13 +96,7 @@ def _patch_generation_config_if_needed(model_config: Any) -> None:
 
 def _inject_global_id(target: Any, request_id: str) -> None:
     """Inject global_request_id into a prompt dict's additional_information."""
-    if isinstance(target, dict):
-        if "additional_information" not in target:
-            target["additional_information"] = {}
-        if target["additional_information"] is None:
-            target["additional_information"] = {}
-        if isinstance(target["additional_information"], dict):
-            target["additional_information"]["global_request_id"] = [str(request_id)]
+    stage0_processing.inject_global_request_id(target, request_id)
 
 
 def _upgrade_to_omni_request(
@@ -114,42 +104,7 @@ def _upgrade_to_omni_request(
     raw_prompt: Any,
 ) -> EngineCoreRequest:
     """Restore omni-only fields omitted by upstream InputProcessor."""
-    prompt_embeds = request.prompt_embeds
-    additional_information = None
-
-    if isinstance(raw_prompt, dict):
-        if prompt_embeds is None:
-            raw_prompt_embeds = raw_prompt.get("prompt_embeds")
-            if isinstance(raw_prompt_embeds, torch.Tensor):
-                prompt_embeds = raw_prompt_embeds
-        additional_information = serialize_additional_information(
-            raw_prompt.get("additional_information"),
-            log_prefix="AsyncOmniEngine",
-        )
-
-    if prompt_embeds is None and additional_information is None:
-        return request
-
-    return OmniEngineCoreRequest(
-        request_id=request.request_id,
-        prompt_token_ids=request.prompt_token_ids,
-        mm_features=request.mm_features,
-        sampling_params=request.sampling_params,
-        pooling_params=request.pooling_params,
-        arrival_time=request.arrival_time,
-        lora_request=request.lora_request,
-        cache_salt=request.cache_salt,
-        data_parallel_rank=request.data_parallel_rank,
-        prompt_embeds=prompt_embeds,
-        client_index=request.client_index,
-        current_wave=request.current_wave,
-        priority=request.priority,
-        trace_headers=request.trace_headers,
-        resumable=request.resumable,
-        external_req_id=request.external_req_id,
-        reasoning_ended=request.reasoning_ended,
-        additional_information=additional_information,
-    )
+    return stage0_processing.upgrade_to_omni_request(request, raw_prompt)
 
 
 def _apply_omni_final_stage_metadata(
@@ -157,31 +112,7 @@ def _apply_omni_final_stage_metadata(
     final_stage_id: int,
 ) -> EngineCoreRequest:
     """Tag EngineCoreRequest so OmniARScheduler can skip DiT KV when final_stage_id is 0."""
-    merged: dict[str, Any] = {}
-    if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
-        merged = deserialize_additional_information(request.additional_information)
-    merged["omni_final_stage_id"] = final_stage_id
-    payload = serialize_additional_information(merged)
-    return OmniEngineCoreRequest(
-        request_id=request.request_id,
-        prompt_token_ids=request.prompt_token_ids,
-        mm_features=request.mm_features,
-        sampling_params=request.sampling_params,
-        pooling_params=request.pooling_params,
-        arrival_time=request.arrival_time,
-        lora_request=request.lora_request,
-        cache_salt=request.cache_salt,
-        data_parallel_rank=request.data_parallel_rank,
-        prompt_embeds=request.prompt_embeds,
-        client_index=request.client_index,
-        current_wave=request.current_wave,
-        priority=request.priority,
-        trace_headers=request.trace_headers,
-        resumable=request.resumable,
-        external_req_id=request.external_req_id,
-        reasoning_ended=request.reasoning_ended,
-        additional_information=payload,
-    )
+    return stage0_processing.apply_omni_final_stage_metadata(request, final_stage_id)
 
 
 def _weak_shutdown_async_omni_engine(
@@ -945,15 +876,11 @@ class AsyncOmniEngine:
         original_prompt: Any,
     ) -> None:
         """Register a caller-thread stage-0 request with the stage-0 output processor."""
-        output_prompt_text = prompt_text
-        if output_prompt_text is None and isinstance(original_prompt, dict):
-            output_prompt_text = original_prompt.get("prompt")
-        self.output_processors[0].add_request(
+        stage0_processing.register_stage0_output(
+            self.output_processors[0],
             request=request,
-            prompt=output_prompt_text,
-            parent_req=None,
-            request_index=0,
-            queue=None,
+            prompt_text=prompt_text,
+            original_prompt=original_prompt,
         )
 
     def _build_add_request_message(
