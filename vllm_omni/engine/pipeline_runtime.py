@@ -769,7 +769,7 @@ class PipelineRuntime:
             req_state.mark_stage_submitted(next_stage_id, _time.time())
 
     async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
-        """Handle an add_companion_request message: submit companion to the entry stage."""
+        """Handle an add_companion_request message via entry-stage ingress."""
         if self.entry_runtime is None or self.entry_stage_pos is None:
             raise RuntimeError("PipelineRuntime requires at least one entry stage")
 
@@ -777,6 +777,7 @@ class PipelineRuntime:
         parent_id = msg["parent_id"]
         role = msg["role"]
         companion_prompt = msg["prompt"]
+        original_prompt = msg.get("original_prompt", companion_prompt)
         sampling_params_list = msg["sampling_params_list"]
 
         if parent_id not in self.request_states:
@@ -811,19 +812,22 @@ class PipelineRuntime:
                 resumable=msg.get("resumable", False),
             ),
             data=PipelineData(
-                raw_prompt=companion_prompt,
-                stage0_request=companion_prompt,
+                raw_prompt=original_prompt,
+                stage0_request=None,
                 terminal_outputs={},
             ),
         )
         companion_state.mark_stage_submitted(self.entry_stage_pos, _time.time())
         self.request_states[companion_id] = companion_state
 
-        await self.entry_runtime.submit(
-            request=companion_prompt,
-            request_id=companion_id,
-            params=sampling_params_list[0] if sampling_params_list else None,
-        )
+        try:
+            await self.entry_runtime.accept_external_request(
+                meta=companion_state.meta,
+                data=companion_state.data,
+            )
+        except Exception as error:
+            await self._handle_entry_request_error(parent_id, error)
+            return
 
         logger.info(
             "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s)",

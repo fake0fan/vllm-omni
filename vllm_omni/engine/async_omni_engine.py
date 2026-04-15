@@ -43,7 +43,6 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
 )
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
-from vllm_omni.engine import stage0_processing
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_core_proc import (
     complete_stage_handshake,
@@ -92,27 +91,6 @@ def _patch_generation_config_if_needed(model_config: Any) -> None:
         model_config.try_get_generation_config()
     except Exception:
         model_config.try_get_generation_config = lambda: {}
-
-
-def _inject_global_id(target: Any, request_id: str) -> None:
-    """Inject global_request_id into a prompt dict's additional_information."""
-    stage0_processing.inject_global_request_id(target, request_id)
-
-
-def _upgrade_to_omni_request(
-    request: EngineCoreRequest,
-    raw_prompt: Any,
-) -> EngineCoreRequest:
-    """Restore omni-only fields omitted by upstream InputProcessor."""
-    return stage0_processing.upgrade_to_omni_request(request, raw_prompt)
-
-
-def _apply_omni_final_stage_metadata(
-    request: EngineCoreRequest,
-    final_stage_id: int,
-) -> EngineCoreRequest:
-    """Tag EngineCoreRequest so OmniARScheduler can skip DiT KV when final_stage_id is 0."""
-    return stage0_processing.apply_omni_final_stage_metadata(request, final_stage_id)
 
 
 def _weak_shutdown_async_omni_engine(
@@ -831,6 +809,9 @@ class AsyncOmniEngine:
                 stage_clients=self.stage_clients,
                 output_processors=self.output_processors,
                 stage_vllm_configs=self.stage_vllm_configs,
+                entry_input_processor=self.input_processor,
+                supported_tasks=self.supported_tasks,
+                prompt_expand_func=self.prompt_expand_func,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -868,21 +849,6 @@ class AsyncOmniEngine:
 
     # ---- request helpers ----
 
-    def _register_stage0_request(
-        self,
-        *,
-        request: EngineCoreRequest,
-        prompt_text: str | None,
-        original_prompt: Any,
-    ) -> None:
-        """Register a caller-thread stage-0 request with the stage-0 output processor."""
-        stage0_processing.register_stage0_output(
-            self.output_processors[0],
-            request=request,
-            prompt_text=prompt_text,
-            original_prompt=original_prompt,
-        )
-
     def _build_add_request_message(
         self,
         request_id: str,
@@ -901,13 +867,7 @@ class AsyncOmniEngine:
         resumable: bool = False,
         message_type: str = "add_request",
     ) -> dict[str, Any]:
-        """Build an add_request message after caller-thread stage-0 preprocessing.
-
-        PR1 keeps the AsyncOmniEngine compatibility boundary explicit:
-        stage-0 input processing and stage-0 output-processor registration
-        intentionally still happen in the caller thread. This temporary
-        boundary stays in place until PR2 extracts the bootstrap/runtime split.
-        """
+        """Pack a raw ingress message for background entry-stage processing."""
         effective_sampling_params_list = (
             list(sampling_params_list) if sampling_params_list is not None else list(self.default_sampling_params_list)
         )
@@ -915,65 +875,23 @@ class AsyncOmniEngine:
             raise ValueError(
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
-        params = effective_sampling_params_list[0]
-
-        # Keep the original prompt for downstream stages (they need the raw
-        # dict, e.g. for multi_modal_data).
-        original_prompt = prompt
-
-        stage_type = self.stage_metadata[0].get("stage_type")
-        if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
-            # Inject global_request_id into the raw prompt.
-            if isinstance(prompt, dict):
-                _inject_global_id(prompt, request_id)
-            elif isinstance(prompt, list):
-                for item in prompt:
-                    _inject_global_id(item, request_id)
-
-            # Full input processing (tokenization, multimodal, etc.)
-            request = self.input_processor.process_inputs(
-                request_id=request_id,
-                prompt=prompt,
-                params=params,
-                supported_tasks=self.supported_tasks,
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-                data_parallel_rank=data_parallel_rank,
-                resumable=resumable,
-            )
-            # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
-            # additional_information field in the prompt.
-            request = _upgrade_to_omni_request(request, prompt)
-
-            if reasoning_ended is not None:
-                request.reasoning_ended = reasoning_ended
-
-            # Restore external_req_id to the original user-facing request_id.
-            # InputProcessor.process_inputs() renames request_id to an internal
-            # UUID (saving the original in external_req_id), but then overwrites
-            # external_req_id with the new internal ID. We need external_req_id
-            # to match the key used in Orchestrator.request_states so that
-            # output routing (output.request_id lookup) can find the req_state.
-            request.external_req_id = request_id
-            request = _apply_omni_final_stage_metadata(request, final_stage_id)
-
-            self._register_stage0_request(
-                request=request,
-                prompt_text=prompt_text,
-                original_prompt=original_prompt,
-            )
-            prompt = request
 
         return {
             "type": message_type,
             "request_id": request_id,
             "prompt": prompt,
-            "original_prompt": original_prompt,
+            "original_prompt": prompt,
             "sampling_params_list": effective_sampling_params_list,
             "final_stage_id": final_stage_id,
+            "prompt_text": prompt_text,
+            "arrival_time": arrival_time,
+            "lora_request": lora_request,
+            "tokenization_kwargs": tokenization_kwargs,
+            "trace_headers": dict(trace_headers) if trace_headers is not None else None,
+            "priority": priority,
+            "data_parallel_rank": data_parallel_rank,
+            "reasoning_ended": reasoning_ended,
+            "resumable": resumable,
         }
 
     def _enqueue_cfg_companions(
@@ -983,7 +901,7 @@ class AsyncOmniEngine:
         stage0_params: Any,
         sampling_params_list: list[Any],
     ) -> None:
-        """Expand prompt into CFG companions, process through InputProcessor, and enqueue."""
+        """Expand prompt into CFG companions and enqueue raw ingress messages."""
         try:
             expanded = self.prompt_expand_func(original_prompt, stage0_params)
         except Exception:
@@ -997,27 +915,7 @@ class AsyncOmniEngine:
             cid = f"{parent_id}{ep.request_id_suffix}"
             companion_prompt = ep.prompt
 
-            companion_params, companion_spl = ep.apply_overrides(stage0_params, sampling_params_list)
-
-            if isinstance(companion_prompt, dict):
-                _inject_global_id(companion_prompt, cid)
-
-            request = self.input_processor.process_inputs(
-                request_id=cid,
-                prompt=companion_prompt,
-                params=companion_params,
-                supported_tasks=self.supported_tasks,
-            )
-            request = _upgrade_to_omni_request(request, companion_prompt)
-            request.external_req_id = cid
-
-            self.output_processors[0].add_request(
-                request=request,
-                prompt=companion_prompt,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
+            _companion_params, companion_spl = ep.apply_overrides(stage0_params, sampling_params_list)
 
             self.request_queue.sync_q.put_nowait(
                 {
@@ -1025,7 +923,8 @@ class AsyncOmniEngine:
                     "companion_id": cid,
                     "parent_id": parent_id,
                     "role": ep.role,
-                    "prompt": request,
+                    "prompt": companion_prompt,
+                    "original_prompt": companion_prompt,
                     "sampling_params_list": companion_spl,
                 }
             )
@@ -1312,13 +1211,7 @@ class AsyncOmniEngine:
         *,
         resumable: bool = False,
     ) -> None:
-        """Process stage-0 input locally, then send to the Orchestrator.
-
-        Input processing and output
-        processor registration happen here in the caller's thread, avoiding
-        a queue + coroutine-switch round-trip.  The Orchestrator receives a
-        ready-to-submit OmniEngineCoreRequest.
-        """
+        """Send a raw request envelope to the background orchestrator."""
         msg = self._build_add_request_message(
             request_id=request_id,
             prompt=prompt,

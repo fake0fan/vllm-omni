@@ -164,6 +164,73 @@ def test_add_companion_drops_message_when_parent_request_is_already_gone() -> No
     assert runtime._companion_done == {}
 
 
+def test_add_companion_routes_raw_prompt_through_entry_runtime_ingress() -> None:
+    runtime = object.__new__(PipelineRuntime)
+    observed = {}
+
+    async def _accept_external_request(*, meta, data):
+        observed["meta"] = meta
+        observed["data"] = data
+        data.stage0_request = {"request_id": meta.request_id}
+        return data.stage0_request
+
+    runtime.entry_runtime = SimpleNamespace(accept_external_request=_accept_external_request)
+    runtime.entry_stage_pos = 0
+    runtime.entry_stage_id = 5
+    runtime.request_states = {
+        "req-parent": PipelineRequestState(
+            meta=RequestMeta(
+                request_id="req-parent",
+                final_stage_id=1,
+                sampling_params_list=[SamplingParams(max_tokens=4), SamplingParams(max_tokens=6)],
+            ),
+            data=PipelineData(raw_prompt={"prompt": "parent"}, stage0_request=None, terminal_outputs={}),
+        )
+    }
+    runtime._companion_map = {}
+    runtime._companion_ids = set()
+    runtime._companion_to_parent = {}
+    runtime._companion_done = {}
+
+    prompt = {"prompt": "companion"}
+    params = SamplingParams(max_tokens=4)
+    asyncio.run(
+        PipelineRuntime._handle_add_companion(
+            runtime,
+            {
+                "companion_id": "req-parent-neg",
+                "parent_id": "req-parent",
+                "role": "negative",
+                "prompt": prompt,
+                "original_prompt": prompt,
+                "sampling_params_list": [params],
+                "prompt_text": "negative text",
+                "arrival_time": 9.5,
+                "priority": 3,
+                "resumable": True,
+            },
+        )
+    )
+
+    companion_state = runtime.request_states["req-parent-neg"]
+    assert observed["meta"] is companion_state.meta
+    assert observed["data"] is companion_state.data
+    assert observed["meta"].request_id == "req-parent-neg"
+    assert observed["meta"].final_stage_id == 0
+    assert observed["meta"].sampling_params_list == [params]
+    assert observed["meta"].prompt_text == "negative text"
+    assert observed["meta"].arrival_time == 9.5
+    assert observed["meta"].priority == 3
+    assert observed["meta"].resumable is True
+    assert observed["data"].raw_prompt is prompt
+    assert companion_state.data.stage0_request == {"request_id": "req-parent-neg"}
+    assert runtime._companion_map == {"req-parent": {"negative": "req-parent-neg"}}
+    assert runtime._companion_ids == {"req-parent-neg"}
+    assert runtime._companion_to_parent == {"req-parent-neg": "req-parent"}
+    assert runtime._companion_done == {"req-parent": set()}
+    assert companion_state.stage_submit_ts[0] > 0
+
+
 def test_streaming_update_entry_failure_aborts_parent_and_live_companions() -> None:
     runtime = object.__new__(PipelineRuntime)
     output_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
