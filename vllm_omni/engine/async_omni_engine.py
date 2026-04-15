@@ -923,47 +923,6 @@ class AsyncOmniEngine:
             "resumable": resumable,
         }
 
-    def _enqueue_cfg_companions(
-        self,
-        parent_id: str,
-        original_prompt: Any,
-        stage0_params: Any,
-        sampling_params_list: list[Any],
-    ) -> None:
-        """Expand prompt into CFG companions and enqueue raw ingress messages."""
-        try:
-            expanded = self.prompt_expand_func(original_prompt, stage0_params)
-        except Exception:
-            logger.exception("[AsyncOmniEngine] prompt_expand_func failed for req %s", parent_id)
-            return
-
-        if not expanded:
-            return
-
-        for ep in expanded:
-            cid = f"{parent_id}{ep.request_id_suffix}"
-            companion_prompt = _clone_prompt_for_async_boundary(ep.prompt)
-
-            _companion_params, companion_spl = ep.apply_overrides(stage0_params, sampling_params_list)
-
-            self.request_queue.sync_q.put_nowait(
-                {
-                    "type": "add_companion_request",
-                    "companion_id": cid,
-                    "parent_id": parent_id,
-                    "role": ep.role,
-                    "prompt": companion_prompt,
-                    "original_prompt": companion_prompt,
-                    "sampling_params_list": companion_spl,
-                }
-            )
-
-        logger.info(
-            "[AsyncOmniEngine] CFG expansion for req %s: %d companions",
-            parent_id,
-            len(expanded),
-        )
-
     @staticmethod
     def _get_default_cache_config(cache_backend: str | None) -> dict[str, Any] | None:
         if cache_backend == "cache_dit":
@@ -1259,15 +1218,6 @@ class AsyncOmniEngine:
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
         self.request_queue.sync_q.put_nowait(msg)
-
-        # CFG companion expansion: create and enqueue companion requests
-        # so the AR stage also generates their KV caches.
-        if self.prompt_expand_func is not None and final_stage_id > 0:
-            original_prompt = msg.get("original_prompt", prompt)
-            effective_spl = msg.get("sampling_params_list", [])
-            stage0_params = effective_spl[0] if effective_spl else None
-            if stage0_params is not None:
-                self._enqueue_cfg_companions(request_id, original_prompt, stage0_params, effective_spl)
 
     async def add_request_async(
         self,

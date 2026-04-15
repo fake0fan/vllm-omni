@@ -39,6 +39,33 @@ def _uses_prebuilt_stage0_request(prompt: Any, *, entry_uses_prebuilt_request: b
     return isinstance(prompt, EngineCoreRequest) or entry_uses_prebuilt_request
 
 
+def _clone_prompt_for_runtime_ownership(prompt: Any) -> Any:
+    if isinstance(prompt, EngineCoreRequest):
+        return prompt
+
+    if isinstance(prompt, dict):
+        cloned = dict(prompt)
+        additional_information = cloned.get("additional_information")
+        if isinstance(additional_information, dict):
+            cloned["additional_information"] = dict(additional_information)
+        return cloned
+
+    if isinstance(prompt, list):
+        cloned_items: list[Any] = []
+        for item in prompt:
+            if isinstance(item, dict):
+                cloned_item = dict(item)
+                additional_information = cloned_item.get("additional_information")
+                if isinstance(additional_information, dict):
+                    cloned_item["additional_information"] = dict(additional_information)
+                cloned_items.append(cloned_item)
+            else:
+                cloned_items.append(item)
+        return cloned_items
+
+    return prompt
+
+
 async def _accept_prebuilt_llm_entry_request(
     self: StageRuntime,
     *,
@@ -622,6 +649,48 @@ class PipelineRuntime:
         await self._cleanup_failed_entry_request(request_id)
         await self._emit_request_error(request_id, error)
 
+    async def _maybe_expand_cfg_companions(self, req_state: PipelineRequestState) -> bool:
+        if self.prompt_expand_func is None:
+            return True
+        if self.entry_stage_pos is None or req_state.final_stage_id <= self.entry_stage_pos:
+            return True
+
+        try:
+            expanded = self.prompt_expand_func(req_state.data.raw_prompt, req_state.meta.entry_params)
+        except Exception as error:
+            logger.exception("[Orchestrator] prompt_expand_func failed for req %s", req_state.request_id)
+            await self._handle_entry_request_error(req_state.request_id, error)
+            return False
+
+        if not expanded:
+            return True
+
+        for ep in expanded:
+            _companion_params, companion_spl = ep.apply_overrides(
+                req_state.meta.entry_params,
+                req_state.meta.sampling_params_list,
+            )
+            companion_prompt = _clone_prompt_for_runtime_ownership(ep.prompt)
+            await self._handle_add_companion(
+                {
+                    "companion_id": f"{req_state.request_id}{ep.request_id_suffix}",
+                    "parent_id": req_state.request_id,
+                    "role": ep.role,
+                    "prompt": companion_prompt,
+                    "original_prompt": companion_prompt,
+                    "sampling_params_list": companion_spl,
+                }
+            )
+            if req_state.request_id not in self.request_states:
+                return False
+
+        logger.info(
+            "[Orchestrator] CFG expansion for req %s: %d companions",
+            req_state.request_id,
+            len(expanded),
+        )
+        return True
+
     async def _handle_add_request(self, msg: dict[str, Any]) -> None:
         """Handle an add_request message from the main thread."""
         if self.entry_runtime is None or self.entry_stage_pos is None:
@@ -682,6 +751,9 @@ class PipelineRuntime:
             )
         except Exception as error:
             await self._handle_entry_request_error(request_id, error)
+            return
+
+        if not await self._maybe_expand_cfg_companions(req_state):
             return
 
         if self.async_chunk and final_stage_id > self.entry_stage_pos:

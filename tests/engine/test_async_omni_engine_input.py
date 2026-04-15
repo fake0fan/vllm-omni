@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
@@ -176,54 +174,40 @@ def test_build_add_request_message_keeps_prebuilt_request_identity(mocker: Mocke
     engine.output_processors[0].add_request.assert_not_called()
 
 
-def test_enqueue_cfg_companions_packs_raw_messages_with_overrides(mocker: MockerFixture) -> None:
+def test_add_request_only_enqueues_parent_message_and_skips_caller_thread_cfg_expansion(
+    mocker: MockerFixture,
+) -> None:
     engine = object.__new__(AsyncOmniEngine)
     request_queue = mocker.Mock()
     request_queue.sync_q = mocker.Mock()
     engine.request_queue = request_queue
     engine.input_processor = mocker.Mock()
     engine.output_processors = [mocker.Mock()]
+    engine.default_sampling_params_list = [SamplingParams(max_tokens=8)]
+    engine.stage_metadata = [{"stage_type": "llm"}, {"stage_type": "diffusion"}]
+    engine.supported_tasks = ("generate",)
+    engine.prompt_expand_func = mocker.Mock()
 
-    original_prompt = {"prompt": "parent prompt"}
-    stage0_params = SamplingParams(max_tokens=8, temperature=0.9)
-    sampling_params_list = [stage0_params, SamplingParams(max_tokens=16)]
-    companion_params = SamplingParams(max_tokens=8, temperature=0.0)
-    companion_spl = [companion_params, sampling_params_list[1]]
-    expanded_prompt = {"prompt": "negative prompt"}
-    expanded = SimpleNamespace(
-        request_id_suffix="-neg",
-        prompt=expanded_prompt,
-        role="negative",
-        apply_overrides=mocker.Mock(return_value=(companion_params, companion_spl)),
-    )
-    engine.prompt_expand_func = mocker.Mock(return_value=[expanded])
+    prompt = {"prompt": "parent prompt"}
+    params = [SamplingParams(max_tokens=8), SamplingParams(max_tokens=16)]
 
-    engine._enqueue_cfg_companions(
-        parent_id="req-parent",
-        original_prompt=original_prompt,
-        stage0_params=stage0_params,
-        sampling_params_list=sampling_params_list,
+    engine.add_request(
+        request_id="req-parent",
+        prompt=prompt,
+        sampling_params_list=params,
+        final_stage_id=1,
     )
 
-    engine.prompt_expand_func.assert_called_once_with(original_prompt, stage0_params)
-    expanded.apply_overrides.assert_called_once_with(stage0_params, sampling_params_list)
-    request_queue.sync_q.put_nowait.assert_called_once_with(
-        {
-            "type": "add_companion_request",
-            "companion_id": "req-parent-neg",
-            "parent_id": "req-parent",
-            "role": "negative",
-            "prompt": request_queue.sync_q.put_nowait.call_args.args[0]["prompt"],
-            "original_prompt": request_queue.sync_q.put_nowait.call_args.args[0]["original_prompt"],
-            "sampling_params_list": companion_spl,
-        }
-    )
+    engine.prompt_expand_func.assert_not_called()
+    request_queue.sync_q.put_nowait.assert_called_once()
     enqueued = request_queue.sync_q.put_nowait.call_args.args[0]
-    assert enqueued["prompt"] == expanded_prompt
-    assert enqueued["prompt"] is not expanded_prompt
+    assert enqueued["type"] == "add_request"
+    assert enqueued["request_id"] == "req-parent"
+    assert enqueued["prompt"] == prompt
+    assert enqueued["prompt"] is not prompt
     assert enqueued["original_prompt"] is enqueued["prompt"]
-    inject_global_request_id(enqueued["prompt"], "req-parent-neg")
-    assert "additional_information" not in expanded_prompt
-    assert enqueued["prompt"]["additional_information"]["global_request_id"] == ["req-parent-neg"]
+    inject_global_request_id(enqueued["prompt"], "req-parent")
+    assert "additional_information" not in prompt
+    assert enqueued["prompt"]["additional_information"]["global_request_id"] == ["req-parent"]
     engine.input_processor.process_inputs.assert_not_called()
     engine.output_processors[0].add_request.assert_not_called()
