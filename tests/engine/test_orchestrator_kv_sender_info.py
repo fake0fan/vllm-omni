@@ -5,6 +5,7 @@ import pytest
 from vllm import SamplingParams
 
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.pipeline_state import PipelineData, RequestMeta
 from vllm_omni.engine.stage_runtime import build_stage_runtimes
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -60,6 +61,30 @@ class _DummyDiffusionStage:
                 "kv_sender_info": kv_sender_info,
             }
         )
+
+
+def _build_request_state(*, request_id: str, prompt: object, sampling_params_list: list[object], final_stage_id: int):
+    return OrchestratorRequestState(
+        meta=RequestMeta(
+            request_id=request_id,
+            final_stage_id=final_stage_id,
+            sampling_params_list=sampling_params_list,
+            prompt_text=prompt.get("prompt") if isinstance(prompt, dict) else None,
+            arrival_time=0.0,
+            lora_request=None,
+            tokenization_kwargs=None,
+            trace_headers=None,
+            priority=0,
+            data_parallel_rank=None,
+            reasoning_ended=None,
+            resumable=False,
+        ),
+        data=PipelineData(
+            raw_prompt=prompt,
+            stage0_request=None,
+            terminal_outputs=[],
+        ),
+    )
 
 
 def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
@@ -160,9 +185,9 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     orchestrator.output_processors = [None, None]
 
     params = OmniDiffusionSamplingParams()
-    req_state = OrchestratorRequestState(
-        global_request_id="req-1",
-        original_prompt={"prompt": "hello"},
+    req_state = _build_request_state(
+        request_id="req-1",
+        prompt={"prompt": "hello"},
         sampling_params_list=[SamplingParams(max_tokens=4), params],
         final_stage_id=1,
     )
@@ -206,9 +231,9 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     orchestrator.output_processors = [None, None, None]
 
     params = OmniDiffusionSamplingParams()
-    req_state = OrchestratorRequestState(
-        global_request_id="req-3",
-        original_prompt={"prompt": "hello"},
+    req_state = _build_request_state(
+        request_id="req-3",
+        prompt={"prompt": "hello"},
         sampling_params_list=[SamplingParams(max_tokens=4), SamplingParams(max_tokens=4), params],
         final_stage_id=2,
     )
@@ -247,9 +272,9 @@ def test_forward_to_diffusion_preserves_batch_prompt_from_custom_process_input_f
     orchestrator.output_processors = [None, None]
 
     params = OmniDiffusionSamplingParams()
-    req_state = OrchestratorRequestState(
-        global_request_id="req-batch",
-        original_prompt={"prompt": "hello"},
+    req_state = _build_request_state(
+        request_id="req-batch",
+        prompt={"prompt": "hello"},
         sampling_params_list=[SamplingParams(max_tokens=4), params],
         final_stage_id=1,
     )
@@ -279,9 +304,9 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
     orchestrator.output_processors = [runtime.output_processor for runtime in orchestrator.stage_runtimes]
     orchestrator.stage_vllm_configs = [runtime.stage_vllm_config for runtime in orchestrator.stage_runtimes]
 
-    req_state = OrchestratorRequestState(
-        global_request_id="req-2",
-        original_prompt={"prompt": "hello"},
+    req_state = _build_request_state(
+        request_id="req-2",
+        prompt={"prompt": "hello"},
         sampling_params_list=[SamplingParams(max_tokens=4), OmniDiffusionSamplingParams()],
         final_stage_id=1,
     )
