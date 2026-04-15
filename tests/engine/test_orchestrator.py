@@ -13,6 +13,7 @@ import janus
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest
 
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -109,8 +110,32 @@ class FakeOutputProcessor:
         return None
 
 
+class FakeInputProcessor:
+    def __init__(self, prepared_request: EngineCoreRequest) -> None:
+        self.prepared_request = prepared_request
+        self.calls: list[dict[str, Any]] = []
+
+    def process_inputs(self, **kwargs) -> EngineCoreRequest:
+        self.calls.append(kwargs)
+        return self.prepared_request
+
+
 def _sampling_params(max_tokens: int = 4) -> SamplingParams:
     return SamplingParams(max_tokens=max_tokens)
+
+
+def _engine_core_request(request_id: str, prompt_token_ids: list[int]) -> EngineCoreRequest:
+    return EngineCoreRequest(
+        request_id=request_id,
+        prompt_token_ids=prompt_token_ids,
+        mm_features=None,
+        sampling_params=_sampling_params(),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
 
 
 def _engine_core_outputs(tag: str, timestamp: float) -> SimpleNamespace:
@@ -152,6 +177,8 @@ def _build_harness(
     output_processors: list[object] | None = None,
     stage_vllm_configs: list[object] | None = None,
     async_chunk: bool = False,
+    entry_input_processor: object | None = None,
+    supported_tasks: tuple[str, ...] | None = None,
 ) -> OrchestratorFixture:
     for stage_id, stage_client in enumerate(stage_clients):
         if getattr(stage_client, "stage_id", None) is None:
@@ -183,6 +210,8 @@ def _build_harness(
                 output_processors=output_processors,
                 stage_vllm_configs=stage_vllm_configs,
                 async_chunk=async_chunk,
+                entry_input_processor=entry_input_processor,
+                supported_tasks=supported_tasks,
             )
             ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))
             await orchestrator.run()
@@ -339,6 +368,70 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         assert output_msg["finished"] is True
         assert output_msg["engine_outputs"].request_id == "req-llm"
         assert "req-llm" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_run_two_stage_llm_entry_runtime_processes_raw_prompt(orchestrator_factory) -> None:
+    stage0 = FakeStageClient(stage_id=7, stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(
+        stage_id=11,
+        stage_type="llm",
+        final_output=True,
+        next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
+    )
+    processors = [
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-entry", token_ids=[3, 4], finished=True)]),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-entry", token_ids=[10, 11], finished=True)]),
+    ]
+    entry_input_processor = FakeInputProcessor(_engine_core_request("prepared-entry", [1, 2, 3]))
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=processors,
+        entry_input_processor=entry_input_processor,
+        supported_tasks=("generate", "speech"),
+    )
+    raw_prompt = {"prompt": "hello raw"}
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-entry",
+            prompt=raw_prompt,
+            original_prompt=raw_prompt,
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        assert orchestrator_fixture.orchestrator.entry_runtime.stage_id == stage0.stage_id
+        assert orchestrator_fixture.orchestrator.entry_stage_id == stage0.stage_id
+        assert entry_input_processor.calls[0]["request_id"] == "req-entry"
+        assert entry_input_processor.calls[0]["prompt"] == raw_prompt
+        assert entry_input_processor.calls[0]["supported_tasks"] == ("generate", "speech")
+
+        stage0_request = stage0.add_request_calls[0][0]
+        assert isinstance(stage0_request, EngineCoreRequest)
+        assert stage0_request.external_req_id == "req-entry"
+        assert stage0_request.prompt_token_ids == [1, 2, 3]
+
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage1_request = stage1.add_request_calls[0][0]
+        assert stage1_request.request_id == "req-entry"
+        assert stage1_request.prompt_token_ids == [7, 8, 9]
+
+        stage1.push_engine_core_outputs(_engine_core_outputs("stage1-raw", 2.0))
+
+        output_msg = await _get_output_message(orchestrator_fixture)
+
+        assert output_msg["request_id"] == "req-entry"
+        assert output_msg["stage_id"] == 1
+        assert output_msg["finished"] is True
+        assert output_msg["engine_outputs"].request_id == "req-entry"
+        assert "req-entry" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
