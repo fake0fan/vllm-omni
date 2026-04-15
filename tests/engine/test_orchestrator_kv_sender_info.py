@@ -82,7 +82,7 @@ def _build_request_state(*, request_id: str, prompt: object, sampling_params_lis
         data=PipelineData(
             raw_prompt=prompt,
             stage0_request=None,
-            terminal_outputs=[],
+            terminal_outputs={},
         ),
     )
 

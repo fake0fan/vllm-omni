@@ -23,7 +23,7 @@ def test_pipeline_request_state_tracks_stage_submission_and_completion() -> None
         data=PipelineData(
             raw_prompt={"prompt": "hello"},
             stage0_request={"prompt_token_ids": [1, 2, 3]},
-            terminal_outputs=[],
+            terminal_outputs={},
         ),
     )
 
@@ -37,7 +37,6 @@ def test_pipeline_request_state_tracks_stage_submission_and_completion() -> None
     assert state.sampling_params_list == [SamplingParams(max_tokens=4)]
     assert state.final_stage_id == 1
     assert state.meta.entry_params == SamplingParams(max_tokens=4)
-    assert state.entry_params == SamplingParams(max_tokens=4)
     assert state.active_stage_ids == set()
 
     state.mark_stage_submitted(stage_id=0, submitted_at=1.25)
@@ -71,7 +70,7 @@ def test_pipeline_request_state_can_be_cancelled_without_losing_submit_history()
         data=PipelineData(
             raw_prompt={"prompt": "bye"},
             stage0_request={"prompt_token_ids": [9]},
-            terminal_outputs=[],
+            terminal_outputs={},
         ),
     )
 
@@ -103,7 +102,7 @@ def test_entry_params_requires_stage_zero_sampling_params() -> None:
         data=PipelineData(
             raw_prompt="hello",
             stage0_request=None,
-            terminal_outputs=[],
+            terminal_outputs={},
         ),
     )
 
