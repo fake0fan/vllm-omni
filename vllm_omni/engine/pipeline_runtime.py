@@ -657,10 +657,9 @@ class PipelineRuntime:
 
         try:
             expanded = self.prompt_expand_func(req_state.data.raw_prompt, req_state.meta.entry_params)
-        except Exception as error:
+        except Exception:
             logger.exception("[Orchestrator] prompt_expand_func failed for req %s", req_state.request_id)
-            await self._handle_entry_request_error(req_state.request_id, error)
-            return False
+            return True
 
         if not expanded:
             return True
