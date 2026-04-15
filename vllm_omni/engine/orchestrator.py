@@ -25,7 +25,7 @@ from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_
 from vllm_omni.engine import (
     OmniEngineCoreRequest,
 )
-from vllm_omni.engine.pipeline_state import PipelineRequestState
+from vllm_omni.engine.pipeline_state import PipelineData, PipelineRequestState, RequestMeta
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_runtime import StageRuntime, build_stage_runtimes
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
@@ -582,10 +582,25 @@ class Orchestrator:
         )
 
         req_state = OrchestratorRequestState(
-            global_request_id=request_id,
-            original_prompt=original_prompt,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
+            meta=RequestMeta(
+                request_id=request_id,
+                final_stage_id=final_stage_id,
+                sampling_params_list=sampling_params_list,
+                prompt_text=msg.get("prompt_text"),
+                arrival_time=msg.get("arrival_time"),
+                lora_request=msg.get("lora_request"),
+                tokenization_kwargs=msg.get("tokenization_kwargs"),
+                trace_headers=msg.get("trace_headers"),
+                priority=msg.get("priority", 0),
+                data_parallel_rank=msg.get("data_parallel_rank"),
+                reasoning_ended=msg.get("reasoning_ended"),
+                resumable=msg.get("resumable", False),
+            ),
+            data=PipelineData(
+                raw_prompt=original_prompt,
+                stage0_request=prompt,
+                terminal_outputs={},
+            ),
         )
         req_state.mark_stage_submitted(stage_id, _time.time())
         self.request_states[request_id] = req_state
@@ -618,7 +633,7 @@ class Orchestrator:
             return
 
         if "sampling_params_list" in msg and msg["sampling_params_list"]:
-            req_state.sampling_params_list = msg["sampling_params_list"]
+            req_state.meta.sampling_params_list = msg["sampling_params_list"]
 
         params = req_state.sampling_params_list[stage_id]
         req_state.mark_stage_submitted(stage_id, _time.time())
@@ -714,10 +729,25 @@ class Orchestrator:
         self._companion_done.setdefault(parent_id, set())
 
         companion_state = OrchestratorRequestState(
-            global_request_id=companion_id,
-            original_prompt=companion_prompt,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=0,
+            meta=RequestMeta(
+                request_id=companion_id,
+                final_stage_id=0,
+                sampling_params_list=sampling_params_list,
+                prompt_text=msg.get("prompt_text"),
+                arrival_time=msg.get("arrival_time"),
+                lora_request=msg.get("lora_request"),
+                tokenization_kwargs=msg.get("tokenization_kwargs"),
+                trace_headers=msg.get("trace_headers"),
+                priority=msg.get("priority", 0),
+                data_parallel_rank=msg.get("data_parallel_rank"),
+                reasoning_ended=msg.get("reasoning_ended"),
+                resumable=msg.get("resumable", False),
+            ),
+            data=PipelineData(
+                raw_prompt=companion_prompt,
+                stage0_request=companion_prompt,
+                terminal_outputs={},
+            ),
         )
         companion_state.mark_stage_submitted(0, _time.time())
         self.request_states[companion_id] = companion_state

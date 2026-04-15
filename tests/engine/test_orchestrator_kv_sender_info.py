@@ -63,6 +63,21 @@ class _DummyDiffusionStage:
         )
 
 
+class _DummySubmitStage:
+    def __init__(self):
+        self.calls = []
+
+    async def submit(self, *, request, request_id, params, kv_sender_info=None):
+        self.calls.append(
+            {
+                "request": request,
+                "request_id": request_id,
+                "params": params,
+                "kv_sender_info": kv_sender_info,
+            }
+        )
+
+
 def _build_request_state(*, request_id: str, prompt: object, sampling_params_list: list[object], final_stage_id: int):
     return OrchestratorRequestState(
         meta=RequestMeta(
@@ -85,6 +100,44 @@ def _build_request_state(*, request_id: str, prompt: object, sampling_params_lis
             terminal_outputs={},
         ),
     )
+
+
+def test_streaming_update_mutates_meta_sampling_params_directly():
+    orchestrator = object.__new__(Orchestrator)
+    stage = _DummySubmitStage()
+    orchestrator.stage_runtimes = [stage]
+    orchestrator.request_states = {}
+
+    initial_params = SamplingParams(max_tokens=4)
+    updated_params = SamplingParams(max_tokens=8)
+    req_state = _build_request_state(
+        request_id="req-stream",
+        prompt={"prompt": "hello"},
+        sampling_params_list=[initial_params],
+        final_stage_id=0,
+    )
+    orchestrator.request_states["req-stream"] = req_state
+
+    asyncio.run(
+        Orchestrator._handle_streaming_update(
+            orchestrator,
+            {
+                "request_id": "req-stream",
+                "prompt": {"prompt": "updated"},
+                "sampling_params_list": [updated_params],
+            },
+        )
+    )
+
+    assert req_state.meta.sampling_params_list == [updated_params]
+    assert stage.calls == [
+        {
+            "request": {"prompt": "updated"},
+            "request_id": "req-stream",
+            "params": updated_params,
+            "kv_sender_info": None,
+        }
+    ]
 
 
 def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():
