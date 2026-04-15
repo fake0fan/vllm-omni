@@ -162,3 +162,89 @@ def test_add_companion_drops_message_when_parent_request_is_already_gone() -> No
     assert runtime._companion_ids == set()
     assert runtime._companion_to_parent == {}
     assert runtime._companion_done == {}
+
+
+def test_streaming_update_entry_failure_aborts_parent_and_live_companions() -> None:
+    runtime = object.__new__(PipelineRuntime)
+    output_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    abort_calls: list[list[str]] = []
+
+    async def _accept_streaming_update(*, meta, data):
+        raise ValueError("bad streaming update")
+
+    async def _abort(request_ids):
+        abort_calls.append(list(request_ids))
+
+    parent_id = "req-parent"
+    companion_ids = ["req-parent-pos", "req-parent-neg"]
+    runtime.output_async_queue = output_queue
+    runtime.entry_runtime = SimpleNamespace(accept_streaming_update=_accept_streaming_update)
+    runtime.entry_stage_pos = 0
+    runtime.entry_stage_id = 2
+    runtime._entry_uses_prebuilt_request = False
+    runtime.stage_runtimes = [SimpleNamespace(abort=_abort)]
+    runtime.request_states = {
+        parent_id: PipelineRequestState(
+            meta=RequestMeta(
+                request_id=parent_id,
+                final_stage_id=0,
+                sampling_params_list=[SamplingParams(max_tokens=4)],
+            ),
+            data=PipelineData(raw_prompt={"prompt": "parent"}, stage0_request=None, terminal_outputs={}),
+        ),
+        companion_ids[0]: PipelineRequestState(
+            meta=RequestMeta(
+                request_id=companion_ids[0],
+                final_stage_id=0,
+                sampling_params_list=[SamplingParams(max_tokens=4)],
+            ),
+            data=PipelineData(raw_prompt={"prompt": "pos"}, stage0_request=None, terminal_outputs={}),
+        ),
+        companion_ids[1]: PipelineRequestState(
+            meta=RequestMeta(
+                request_id=companion_ids[1],
+                final_stage_id=0,
+                sampling_params_list=[SamplingParams(max_tokens=4)],
+            ),
+            data=PipelineData(raw_prompt={"prompt": "neg"}, stage0_request=None, terminal_outputs={}),
+        ),
+    }
+    runtime._companion_map = {
+        parent_id: {
+            "positive": companion_ids[0],
+            "negative": companion_ids[1],
+        }
+    }
+    runtime._companion_ids = set(companion_ids)
+    runtime._companion_to_parent = {
+        companion_ids[0]: parent_id,
+        companion_ids[1]: parent_id,
+    }
+    runtime._companion_done = {parent_id: set()}
+    runtime._deferred_parents = {parent_id: {"stage_id": 0, "output": object()}}
+
+    asyncio.run(
+        PipelineRuntime._handle_streaming_update(
+            runtime,
+            {
+                "request_id": parent_id,
+                "prompt": {"prompt": "updated parent"},
+                "original_prompt": {"prompt": "updated parent"},
+                "sampling_params_list": [SamplingParams(max_tokens=8)],
+            },
+        )
+    )
+
+    assert abort_calls == [[parent_id, *companion_ids]]
+    assert runtime.request_states == {}
+    assert runtime._companion_map == {}
+    assert runtime._companion_ids == set()
+    assert runtime._companion_to_parent == {}
+    assert runtime._companion_done == {}
+    assert runtime._deferred_parents == {}
+    assert output_queue.get_nowait() == {
+        "type": "error",
+        "request_id": parent_id,
+        "stage_id": 0,
+        "error": "bad streaming update",
+    }

@@ -582,19 +582,23 @@ class PipelineRuntime:
         )
 
     async def _cleanup_failed_entry_request(self, request_id: str) -> None:
-        req_state = self.request_states.pop(request_id, None)
-        if req_state is not None:
-            req_state.cancel()
-        self._cleanup_companion_state(request_id)
+        companion_ids = list(self._companion_map.get(request_id, {}).values())
+        all_request_ids = [request_id, *companion_ids]
 
         for runtime in self.stage_runtimes:
             try:
-                await runtime.abort([request_id])
+                await runtime.abort(all_request_ids)
             except Exception:
                 logger.exception(
                     "[Orchestrator] abort failed while cleaning up req=%s after entry failure",
                     request_id,
                 )
+
+        for failed_request_id in all_request_ids:
+            req_state = self.request_states.pop(failed_request_id, None)
+            if req_state is not None:
+                req_state.cancel()
+        self._cleanup_companion_state(request_id)
 
     async def _handle_entry_request_error(self, request_id: str, error: Exception) -> None:
         logger.exception(
