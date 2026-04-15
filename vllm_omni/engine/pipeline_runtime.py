@@ -775,6 +775,15 @@ class PipelineRuntime:
         companion_prompt = msg["prompt"]
         sampling_params_list = msg["sampling_params_list"]
 
+        if parent_id not in self.request_states:
+            logger.warning(
+                "[Orchestrator] Dropping CFG companion %s (role=%s): parent req %s is no longer live",
+                companion_id,
+                role,
+                parent_id,
+            )
+            return
+
         if parent_id not in self._companion_map:
             self._companion_map[parent_id] = {}
         self._companion_map[parent_id][role] = companion_id

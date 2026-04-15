@@ -119,3 +119,46 @@ def test_add_request_entry_failure_emits_request_scoped_error_and_keeps_runtime_
         "stage_id": 0,
         "error": "bad entry request",
     }
+
+
+def test_add_companion_drops_message_when_parent_request_is_already_gone() -> None:
+    runtime = object.__new__(PipelineRuntime)
+    submit_calls: list[dict[str, object]] = []
+
+    async def _submit(*, request, request_id, params):
+        submit_calls.append(
+            {
+                "request": request,
+                "request_id": request_id,
+                "params": params,
+            }
+        )
+
+    runtime.entry_runtime = SimpleNamespace(submit=_submit)
+    runtime.entry_stage_pos = 0
+    runtime.entry_stage_id = 5
+    runtime.request_states = {}
+    runtime._companion_map = {}
+    runtime._companion_ids = set()
+    runtime._companion_to_parent = {}
+    runtime._companion_done = {}
+
+    asyncio.run(
+        PipelineRuntime._handle_add_companion(
+            runtime,
+            {
+                "companion_id": "req-parent-neg",
+                "parent_id": "req-parent",
+                "role": "negative",
+                "prompt": {"prompt": "companion"},
+                "sampling_params_list": [SamplingParams(max_tokens=4)],
+            },
+        )
+    )
+
+    assert submit_calls == []
+    assert runtime.request_states == {}
+    assert runtime._companion_map == {}
+    assert runtime._companion_ids == set()
+    assert runtime._companion_to_parent == {}
+    assert runtime._companion_done == {}
