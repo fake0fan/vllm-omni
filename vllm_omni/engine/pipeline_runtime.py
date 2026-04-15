@@ -20,17 +20,23 @@ from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest
 
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.pipeline_state import PipelineData, PipelineRequestState, RequestMeta
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_runtime import StageRuntime, build_stage_runtimes
+from vllm_omni.engine.stage0_processing import register_stage0_output
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
 
 logger = init_logger(__name__)
+
+
+def _uses_prebuilt_stage0_request(prompt: Any, *, entry_uses_prebuilt_request: bool) -> bool:
+    return isinstance(prompt, EngineCoreRequest) or entry_uses_prebuilt_request
 
 
 async def _accept_prebuilt_llm_entry_request(
@@ -41,6 +47,13 @@ async def _accept_prebuilt_llm_entry_request(
 ) -> Any:
     request = data.stage0_request if data.stage0_request is not None else data.raw_prompt
     data.stage0_request = request
+    if isinstance(request, EngineCoreRequest):
+        register_stage0_output(
+            getattr(self, "output_processor", None),
+            request=request,
+            prompt_text=meta.prompt_text,
+            original_prompt=data.raw_prompt,
+        )
     await self.submit(request=request, request_id=meta.request_id, params=meta.entry_params)
     return request
 
@@ -633,6 +646,7 @@ class PipelineRuntime:
             final_stage_id,
             len(sampling_params_list),
         )
+        entry_uses_prebuilt_request = getattr(self, "_entry_uses_prebuilt_request", False)
 
         req_state = PipelineRequestState(
             meta=RequestMeta(
@@ -651,7 +665,10 @@ class PipelineRuntime:
             ),
             data=PipelineData(
                 raw_prompt=original_prompt,
-                stage0_request=prompt if self._entry_uses_prebuilt_request else None,
+                stage0_request=prompt if _uses_prebuilt_stage0_request(
+                    prompt,
+                    entry_uses_prebuilt_request=entry_uses_prebuilt_request,
+                ) else None,
                 terminal_outputs={},
             ),
         )
@@ -678,6 +695,7 @@ class PipelineRuntime:
         request_id = msg["request_id"]
         request = msg["prompt"]
         original_prompt = msg.get("original_prompt", request)
+        entry_uses_prebuilt_request = getattr(self, "_entry_uses_prebuilt_request", False)
 
         req_state = self.request_states.get(request_id)
         if req_state is None:
@@ -691,8 +709,10 @@ class PipelineRuntime:
             return
 
         req_state.data.raw_prompt = original_prompt
-        if self._entry_uses_prebuilt_request:
-            req_state.data.stage0_request = request
+        req_state.data.stage0_request = request if _uses_prebuilt_stage0_request(
+            request,
+            entry_uses_prebuilt_request=entry_uses_prebuilt_request,
+        ) else None
         if "sampling_params_list" in msg and msg["sampling_params_list"]:
             req_state.meta.sampling_params_list = msg["sampling_params_list"]
 
@@ -779,6 +799,7 @@ class PipelineRuntime:
         companion_prompt = msg["prompt"]
         original_prompt = msg.get("original_prompt", companion_prompt)
         sampling_params_list = msg["sampling_params_list"]
+        entry_uses_prebuilt_request = getattr(self, "_entry_uses_prebuilt_request", False)
 
         if parent_id not in self.request_states:
             logger.warning(
@@ -813,7 +834,10 @@ class PipelineRuntime:
             ),
             data=PipelineData(
                 raw_prompt=original_prompt,
-                stage0_request=None,
+                stage0_request=companion_prompt if _uses_prebuilt_stage0_request(
+                    companion_prompt,
+                    entry_uses_prebuilt_request=entry_uses_prebuilt_request,
+                ) else None,
                 terminal_outputs={},
             ),
         )

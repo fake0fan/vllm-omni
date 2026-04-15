@@ -251,6 +251,42 @@ async def test_llm_stage_runtime_accept_streaming_update_uses_stage0_preprocessi
     assert input_processor.calls[0]["supported_tasks"] == ("generate",)
 
 
+@pytest.mark.asyncio
+async def test_llm_stage_runtime_accept_external_request_preserves_prebuilt_stage0_request() -> None:
+    stage_client = _FakeStageClient(stage_id=0, stage_type="llm")
+    processor = _FakeOutputProcessor()
+    prepared_request = _make_engine_core_request(request_id="base-req")
+    input_processor = _FakeInputProcessor(prepared_request)
+    runtime = LLMStageRuntime(
+        stage_client=stage_client,
+        output_processor=processor,
+        stage_vllm_config=None,
+        input_processor=input_processor,
+        supported_tasks=("generate",),
+    )
+    prebuilt_request = _make_engine_core_request(request_id="req-prebuilt")
+    meta = RequestMeta(
+        request_id="req-prebuilt",
+        final_stage_id=0,
+        sampling_params_list=[SamplingParams(max_tokens=8)],
+        prompt_text="prebuilt prompt",
+    )
+    data = PipelineData(
+        raw_prompt=prebuilt_request,
+        stage0_request=prebuilt_request,
+        terminal_outputs={},
+    )
+
+    submitted = await runtime.accept_external_request(meta=meta, data=data)
+
+    assert submitted is prebuilt_request
+    assert data.stage0_request is prebuilt_request
+    assert processor.add_request_calls[0]["request"] is prebuilt_request
+    assert processor.add_request_calls[0]["prompt"] == "prebuilt prompt"
+    assert stage_client.add_request_calls[0][0] == (prebuilt_request,)
+    assert input_processor.calls == []
+
+
 def test_llm_stage_runtime_requires_output_processor() -> None:
     stage_client = _FakeStageClient(stage_id=1, stage_type="llm")
 

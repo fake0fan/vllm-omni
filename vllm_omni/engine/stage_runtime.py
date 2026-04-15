@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from vllm.v1.engine import EngineCoreRequest
+
 from vllm_omni.engine.pipeline_state import PipelineData, RequestMeta
 from vllm_omni.engine.stage0_processing import (
     prepare_stage0_llm_request,
@@ -119,8 +121,19 @@ class LLMStageRuntime(StageRuntime):
         self.supported_tasks = tuple(supported_tasks) if supported_tasks is not None else ("generate",)
 
     async def _accept_stage0_request(self, *, meta: RequestMeta, data: PipelineData) -> Any:
+        request = data.stage0_request
+        if isinstance(request, EngineCoreRequest):
+            register_stage0_output(
+                self.output_processor,
+                request=request,
+                prompt_text=meta.prompt_text,
+                original_prompt=data.raw_prompt,
+            )
+            await self.submit(request=request, request_id=meta.request_id, params=meta.entry_params)
+            return request
+
         if self.input_processor is None:
-            raise ValueError("LLMStageRuntime requires an input_processor for entry requests")
+            raise ValueError("LLMStageRuntime requires an input_processor for raw entry requests")
 
         request = prepare_stage0_llm_request(
             meta=meta,

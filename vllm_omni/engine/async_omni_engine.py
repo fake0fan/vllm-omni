@@ -93,6 +93,34 @@ def _patch_generation_config_if_needed(model_config: Any) -> None:
         model_config.try_get_generation_config = lambda: {}
 
 
+def _clone_prompt_for_async_boundary(prompt: Any) -> Any:
+    """Clone only prompt containers that stage-0 ingress may mutate."""
+    if isinstance(prompt, EngineCoreRequest):
+        return prompt
+
+    if isinstance(prompt, dict):
+        cloned = dict(prompt)
+        additional_information = cloned.get("additional_information")
+        if isinstance(additional_information, dict):
+            cloned["additional_information"] = dict(additional_information)
+        return cloned
+
+    if isinstance(prompt, list):
+        cloned_items: list[Any] = []
+        for item in prompt:
+            if isinstance(item, dict):
+                cloned_item = dict(item)
+                additional_information = cloned_item.get("additional_information")
+                if isinstance(additional_information, dict):
+                    cloned_item["additional_information"] = dict(additional_information)
+                cloned_items.append(cloned_item)
+            else:
+                cloned_items.append(item)
+        return cloned_items
+
+    return prompt
+
+
 def _weak_shutdown_async_omni_engine(
     orchestrator_thread: threading.Thread | None,
     request_queue: janus.Queue[dict[str, Any]] | None,
@@ -875,12 +903,13 @@ class AsyncOmniEngine:
             raise ValueError(
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
+        owned_prompt = _clone_prompt_for_async_boundary(prompt)
 
         return {
             "type": message_type,
             "request_id": request_id,
-            "prompt": prompt,
-            "original_prompt": prompt,
+            "prompt": owned_prompt,
+            "original_prompt": owned_prompt,
             "sampling_params_list": effective_sampling_params_list,
             "final_stage_id": final_stage_id,
             "prompt_text": prompt_text,
@@ -913,7 +942,7 @@ class AsyncOmniEngine:
 
         for ep in expanded:
             cid = f"{parent_id}{ep.request_id_suffix}"
-            companion_prompt = ep.prompt
+            companion_prompt = _clone_prompt_for_async_boundary(ep.prompt)
 
             _companion_params, companion_spl = ep.apply_overrides(stage0_params, sampling_params_list)
 
