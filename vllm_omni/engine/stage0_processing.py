@@ -28,6 +28,8 @@ def inject_global_request_id(target: Any, request_id: str) -> None:
 def upgrade_to_omni_request(
     request: EngineCoreRequest,
     raw_prompt: Any,
+    *,
+    log_prefix: str = "stage0_processing",
 ) -> EngineCoreRequest:
     """Restore omni-only fields omitted by upstream InputProcessor."""
     prompt_embeds = request.prompt_embeds
@@ -40,7 +42,7 @@ def upgrade_to_omni_request(
                 prompt_embeds = raw_prompt_embeds
         additional_information = serialize_additional_information(
             raw_prompt.get("additional_information"),
-            log_prefix="AsyncOmniEngine",
+            log_prefix=log_prefix,
         )
 
     if prompt_embeds is None and additional_information is None:

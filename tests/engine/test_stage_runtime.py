@@ -317,8 +317,39 @@ async def test_diffusion_stage_runtime_accept_external_request_passes_through_ra
     submitted = await runtime.accept_external_request(meta=meta, data=data)
 
     assert submitted is raw_prompt
+    assert data.stage0_request is raw_prompt
     assert stage_client.add_batch_request_calls[0][0] == ("req-diffusion", raw_prompt, params)
     assert stage_client.add_request_calls == []
+
+
+@pytest.mark.asyncio
+async def test_diffusion_stage_runtime_accept_streaming_update_passes_through_raw_prompt() -> None:
+    stage_client = _FakeStageClient(stage_id=2, stage_type="diffusion", final_output=True)
+    runtime = DiffusionStageRuntime(stage_client=stage_client, output_processor=None, stage_vllm_config=None)
+    params = SimpleNamespace(scale=2.0)
+    raw_prompt = {"prompt": "streaming diffusion"}
+    meta = RequestMeta(
+        request_id="req-diffusion-stream",
+        final_stage_id=2,
+        sampling_params_list=[params],
+        prompt_text=None,
+        arrival_time=None,
+        lora_request=None,
+        tokenization_kwargs=None,
+        trace_headers=None,
+        priority=0,
+        data_parallel_rank=None,
+        reasoning_ended=None,
+        resumable=True,
+    )
+    data = PipelineData(raw_prompt=raw_prompt, stage0_request=None, terminal_outputs={})
+
+    submitted = await runtime.accept_streaming_update(meta=meta, data=data)
+
+    assert submitted is raw_prompt
+    assert data.stage0_request is raw_prompt
+    assert stage_client.add_request_calls[0][0] == ("req-diffusion-stream", raw_prompt, params)
+    assert stage_client.add_batch_request_calls == []
 
 
 @pytest.mark.asyncio

@@ -42,6 +42,7 @@ class StageRuntime(ABC):
 
     async def accept_external_request(self, *, meta: RequestMeta, data: PipelineData) -> Any:
         request = data.raw_prompt
+        data.stage0_request = request
         await self.submit(request=request, request_id=meta.request_id, params=meta.entry_params)
         return request
 
