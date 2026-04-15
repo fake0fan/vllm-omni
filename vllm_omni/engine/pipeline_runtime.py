@@ -634,6 +634,7 @@ class PipelineRuntime:
 
         request_id = msg["request_id"]
         request = msg["prompt"]
+        original_prompt = msg.get("original_prompt", request)
 
         req_state = self.request_states.get(request_id)
         if req_state is None:
@@ -646,7 +647,7 @@ class PipelineRuntime:
             await self._handle_add_request(fallback_msg)
             return
 
-        req_state.data.raw_prompt = request
+        req_state.data.raw_prompt = original_prompt
         if self._entry_uses_prebuilt_request:
             req_state.data.stage0_request = request
         if "sampling_params_list" in msg and msg["sampling_params_list"]:

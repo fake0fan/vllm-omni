@@ -78,6 +78,7 @@ class _DummySubmitStage:
     def __init__(self):
         self.calls = []
         self.engine_outputs = None
+        self.streaming_update_calls = []
 
     def set_engine_outputs(self, outputs):
         self.engine_outputs = outputs
@@ -90,6 +91,22 @@ class _DummySubmitStage:
                 "params": params,
                 "kv_sender_info": kv_sender_info,
             }
+        )
+
+    async def accept_streaming_update(self, *, meta, data):
+        request = data.stage0_request if data.stage0_request is not None else data.raw_prompt
+        self.streaming_update_calls.append(
+            {
+                "meta": meta,
+                "data": data,
+                "request": request,
+            }
+        )
+        data.stage0_request = request
+        await self.submit(
+            request=request,
+            request_id=meta.request_id,
+            params=meta.entry_params,
         )
 
 
@@ -121,6 +138,10 @@ def test_streaming_update_mutates_meta_sampling_params_directly():
     orchestrator = object.__new__(Orchestrator)
     stage = _DummySubmitStage()
     orchestrator.stage_runtimes = [stage]
+    orchestrator.entry_runtime = stage
+    orchestrator.entry_stage_pos = 0
+    orchestrator.entry_stage_id = 0
+    orchestrator._entry_uses_prebuilt_request = False
     orchestrator.request_states = {}
 
     initial_params = SamplingParams(max_tokens=4)
@@ -145,6 +166,7 @@ def test_streaming_update_mutates_meta_sampling_params_directly():
     )
 
     assert req_state.meta.sampling_params_list == [updated_params]
+    assert stage.streaming_update_calls[0]["data"] is req_state.data
     assert stage.calls == [
         {
             "request": {"prompt": "updated"},
@@ -170,6 +192,10 @@ def test_streaming_update_refreshes_prompt_used_by_downstream_forwarding():
     orchestrator._companion_map = {}
     orchestrator.stage_vllm_configs = [None, None]
     orchestrator.output_processors = [None, None]
+    orchestrator.entry_runtime = orchestrator.stage_runtimes[0]
+    orchestrator.entry_stage_pos = 0
+    orchestrator.entry_stage_id = sender_stage.stage_id
+    orchestrator._entry_uses_prebuilt_request = False
 
     initial_prompt = {"prompt": "original"}
     updated_prompt = {"prompt": "updated"}
@@ -416,6 +442,9 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
     orchestrator.stage_clients = [runtime.stage_client for runtime in orchestrator.stage_runtimes]
     orchestrator.output_processors = [runtime.output_processor for runtime in orchestrator.stage_runtimes]
     orchestrator.stage_vllm_configs = [runtime.stage_vllm_config for runtime in orchestrator.stage_runtimes]
+    orchestrator.entry_runtime = orchestrator.stage_runtimes[0]
+    orchestrator.entry_stage_pos = 0
+    orchestrator.entry_stage_id = sender_stage.stage_id
 
     req_state = _build_request_state(
         request_id="req-2",
