@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import time as _time
-from dataclasses import dataclass, field
 from typing import Any
 
 import janus
@@ -21,13 +20,14 @@ from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine import EngineCoreOutputs
 
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 from vllm_omni.engine import (
     OmniEngineCoreRequest,
 )
+from vllm_omni.engine.pipeline_state import PipelineRequestState
 from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.stage_runtime import StageRuntime, build_stage_runtimes
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
@@ -92,17 +92,7 @@ def build_engine_core_request_from_tokens(
 # ============================================================
 
 
-@dataclass
-class OrchestratorRequestState:
-    """Per-request bookkeeping inside the Orchestrator."""
-
-    request_id: str
-    prompt: Any = None
-    sampling_params_list: list[Any] = field(default_factory=list)
-    final_stage_id: int = -1
-
-    # Metrics: timestamp when request was submitted to each stage
-    stage_submit_ts: dict[int, float] = field(default_factory=dict)
+OrchestratorRequestState = PipelineRequestState
 
 
 class Orchestrator:
@@ -127,12 +117,16 @@ class Orchestrator:
         self.output_async_queue = output_async_queue
         self.rpc_async_queue = rpc_async_queue
 
-        self.num_stages = len(stage_clients)
         self.async_chunk = bool(async_chunk)
-
-        self.stage_clients: list[Any] = stage_clients
         self.output_processors: list[Any] = output_processors
         self.stage_vllm_configs: list[Any] = stage_vllm_configs
+        self.stage_runtimes: list[StageRuntime] = build_stage_runtimes(
+            stage_clients=stage_clients,
+            output_processors=output_processors,
+            stage_vllm_configs=stage_vllm_configs,
+        )
+        self.num_stages = len(self.stage_runtimes)
+        self.stage_clients: list[Any] = [runtime.stage_client for runtime in self.stage_runtimes]
 
         # Per-request state
         self.request_states: dict[str, OrchestratorRequestState] = {}
@@ -231,28 +225,12 @@ class Orchestrator:
         """
         while not self._shutdown_event.is_set():
             idle = True
-            for stage_id in range(self.num_stages):
+            for stage_id, runtime in enumerate(self.stage_runtimes):
                 if self._shutdown_event.is_set():
                     return
 
-                # 1) Diffusion stage: poll non-blocking queue
-                # TODO (Peiqi): the output of diffusion stage is OmniRequestOutput,
-                # which is different from EngineCoreOutputs (LLM stages). We may want to unify
-                # the output format in the future to simplify the processing logic in Orchestrator.
-                stage_client = self.stage_clients[stage_id]
-                if stage_client.stage_type == "diffusion":
-                    output = stage_client.get_diffusion_output_nowait()
-                    if output is not None:
-                        idle = False
-                        req_state = self.request_states.get(output.request_id)
-                        if req_state is not None:
-                            stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
-                            await self._route_output(stage_id, output, req_state, stage_metrics)
-                    continue
-
-                # 1) Poll raw outputs from the stage
                 try:
-                    raw_outputs = await asyncio.wait_for(self._poll_stage_raw(stage_id), timeout=0.001)
+                    poll_result = await asyncio.wait_for(runtime.poll_processed_outputs(), timeout=0.001)
                 except asyncio.TimeoutError:
                     continue
                 except asyncio.CancelledError:
@@ -261,23 +239,18 @@ class Orchestrator:
                     if self._shutdown_event.is_set():
                         return
                     logger.exception(
-                        "[Orchestrator] _poll_stage_raw failed for stage-%s",
+                        "[Orchestrator] poll_processed_outputs failed for stage-%s",
                         stage_id,
                     )
                     raise
 
-                if raw_outputs is None:
+                if not poll_result.request_outputs and not poll_result.kv_ready_outputs:
                     continue
                 idle = False
 
-                # Handle prefill-finished KV-ready signals before finished outputs.
-                await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+                await self._handle_kv_ready_outputs(stage_id, poll_result.kv_ready_outputs)
 
-                # 2) Process raw outputs through the output processor
-                request_outputs = await self._process_stage_outputs(stage_id, raw_outputs)
-
-                # 3) Route each processed output
-                for output in request_outputs:
+                for output in poll_result.request_outputs:
                     req_state = self.request_states.get(output.request_id)
                     if req_state is None:
                         logger.warning(
@@ -313,7 +286,10 @@ class Orchestrator:
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
-        stage_client = self.stage_clients[stage_id]
+        runtime = self.stage_runtimes[stage_id]
+
+        if finished:
+            req_state.mark_stage_finished(stage_id)
 
         # CFG companion handling: companions don't produce user-visible output
         # and don't forward to the next stage directly.
@@ -322,7 +298,7 @@ class Orchestrator:
             self.request_states.pop(req_id, None)
             return
 
-        if stage_client.final_output:
+        if runtime.final_output:
             await self.output_async_queue.put(
                 {
                     "type": "output",
@@ -349,7 +325,7 @@ class Orchestrator:
             finished
             and stage_id < req_state.final_stage_id
             and not self.async_chunk
-            and not self._next_stage_already_submitted(stage_id, req_state)
+            and not req_state.next_stage_already_submitted(stage_id)
         ):
             if req_id in self._companion_map and not self._all_companions_done(req_id):
                 self._deferred_parents[req_id] = {
@@ -380,9 +356,6 @@ class Orchestrator:
         done_set = self._companion_done.get(parent_id, set())
         return all(cid in done_set for cid in role_map.values())
 
-    def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
-        return (stage_id + 1) in req_state.stage_submit_ts
-
     async def _handle_cfg_companion_ready(self, req_id: str) -> None:
         """Mark a CFG companion as done; if all companions are done, flush deferred parent."""
         parent_id = self._companion_to_parent.get(req_id)
@@ -395,7 +368,7 @@ class Orchestrator:
         if parent_id in self._deferred_parents and self._all_companions_done(parent_id):
             deferred = self._deferred_parents.pop(parent_id)
             parent_state = self.request_states.get(parent_id)
-            if parent_state is not None and not self._next_stage_already_submitted(deferred["stage_id"], parent_state):
+            if parent_state is not None and not parent_state.next_stage_already_submitted(deferred["stage_id"]):
                 await self._forward_to_next_stage(
                     parent_id,
                     deferred["stage_id"],
@@ -403,14 +376,11 @@ class Orchestrator:
                     parent_state,
                 )
 
-    async def _handle_kv_ready_raw_outputs(self, stage_id: int, raw_outputs: EngineCoreOutputs) -> None:
+    async def _handle_kv_ready_outputs(self, stage_id: int, kv_ready_outputs: list[Any]) -> None:
         """Forward split requests once stage-0 KV is ready, not only when decode fully finishes."""
         if self.async_chunk:
             return
-        for raw_output in raw_outputs.outputs:
-            kv_params = getattr(raw_output, "kv_transfer_params", None)
-            if not (isinstance(kv_params, dict) and kv_params.get("kv_ready")):
-                continue
+        for raw_output in kv_ready_outputs:
             req_id = raw_output.request_id
             req_state = self.request_states.get(req_id)
             if req_state is None:
@@ -420,7 +390,7 @@ class Orchestrator:
                 continue
             if stage_id >= req_state.final_stage_id:
                 continue
-            if self._next_stage_already_submitted(stage_id, req_state):
+            if req_state.next_stage_already_submitted(stage_id):
                 continue
             if req_id in self._companion_map and not self._all_companions_done(req_id):
                 self._deferred_parents[req_id] = {
@@ -514,20 +484,19 @@ class Orchestrator:
         next-stage inputs, build lightweight requests, and submit them.
         """
         next_stage_id = stage_id + 1
-        next_client = self.stage_clients[next_stage_id]
+        current_runtime = self.stage_runtimes[stage_id]
+        next_runtime = self.stage_runtimes[next_stage_id]
         params = req_state.sampling_params_list[next_stage_id]
+        current_runtime.set_engine_outputs([output])
 
-        if next_client.stage_type == "diffusion":
-            self.stage_clients[stage_id].set_engine_outputs([output])
-            if next_client.custom_process_input_func is not None:
-                diffusion_prompt = next_client.custom_process_input_func(
+        if next_runtime.stage_type == "diffusion":
+            if next_runtime.custom_process_input_func is not None:
+                diffusion_prompt = next_runtime.custom_process_input_func(
                     self.stage_clients,
-                    next_client.engine_input_source,
+                    next_runtime.engine_input_source,
                     req_state.prompt,
                     False,
                 )
-                if isinstance(diffusion_prompt, list):
-                    diffusion_prompt = diffusion_prompt[0]
             else:
                 diffusion_prompt = req_state.prompt
 
@@ -546,30 +515,19 @@ class Orchestrator:
                         req_id,
                     )
 
-            source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [stage_id])
+            source_stage_ids = list(next_runtime.engine_input_source or [stage_id])
             kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
-            if isinstance(diffusion_prompt, list):
-                await next_client.add_batch_request_async(
-                    req_id,
-                    diffusion_prompt,
-                    params,
-                    kv_sender_info=kv_sender_info,
-                )
-            else:
-                await next_client.add_request_async(
-                    req_id,
-                    diffusion_prompt,
-                    params,
-                    kv_sender_info=kv_sender_info,
-                )
-            req_state.stage_submit_ts[next_stage_id] = _time.time()
+            await next_runtime.submit(
+                request=diffusion_prompt,
+                request_id=req_id,
+                params=params,
+                kv_sender_info=kv_sender_info,
+            )
+            req_state.mark_stage_submitted(next_stage_id, _time.time())
             return
 
-        self.stage_clients[stage_id].set_engine_outputs([output])
-
-        # Process inputs for next stage
         try:
-            next_inputs = next_client.process_engine_inputs(
+            next_inputs = next_runtime.process_engine_inputs(
                 stage_list=self.stage_clients,
                 prompt=req_state.prompt,
             )
@@ -581,62 +539,23 @@ class Orchestrator:
             )
             raise
 
-        # Build and submit requests for each input
         for next_input in next_inputs:
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
                 prompt=next_input,
                 params=params,
-                model_config=self.stage_vllm_configs[next_stage_id].model_config,
+                model_config=next_runtime.stage_vllm_config.model_config,
             )
 
-            # TODO: Here we directly use the req id to assign.
             request.external_req_id = request.request_id
-
-            self.output_processors[next_stage_id].add_request(
+            next_runtime.register_request(request=request, prompt=None)
+            await next_runtime.submit(
                 request=request,
-                prompt=None,
-                parent_req=None,
-                request_index=0,
-                queue=None,
+                request_id=req_id,
+                params=params,
             )
 
-            await next_client.add_request_async(request)
-
-        # Record submit timestamp for the next stage
-        req_state.stage_submit_ts[next_stage_id] = _time.time()
-
-    async def _poll_stage_raw(self, stage_id: int) -> EngineCoreOutputs | None:
-        """Pull raw EngineCoreOutputs from a stage client without processing.
-
-        Returns the raw outputs object, or None when there is nothing
-        to consume.
-        """
-        outputs = await self.stage_clients[stage_id].get_output_async()
-        if not outputs.outputs:
-            return None
-        return outputs
-
-    async def _process_stage_outputs(self, stage_id: int, raw_outputs: EngineCoreOutputs) -> list[RequestOutput]:
-        """Run the output processor on raw outputs, returning RequestOutputs.
-
-        Also handles abort forwarding and scheduler stats updates.
-        """
-        processor = self.output_processors[stage_id]
-
-        processed = processor.process_outputs(
-            raw_outputs.outputs,
-            raw_outputs.timestamp,
-            None,
-        )
-
-        if processed.reqs_to_abort:
-            await self.stage_clients[stage_id].abort_requests_async(processed.reqs_to_abort)
-
-        if raw_outputs.scheduler_stats is not None:
-            processor.update_scheduler_stats(raw_outputs.scheduler_stats)
-
-        return processed.request_outputs
+        req_state.mark_stage_submitted(next_stage_id, _time.time())
 
     async def _handle_add_request(self, msg: dict[str, Any]) -> None:
         """Handle an add_request message from the main thread."""
@@ -662,33 +581,21 @@ class Orchestrator:
             len(sampling_params_list),
         )
 
-        # Track request state - use original_prompt so downstream stages
-        # (e.g. thinker2talker) can access the raw dict with multi_modal_data.
         req_state = OrchestratorRequestState(
-            request_id=request_id,
-            prompt=original_prompt,
+            global_request_id=request_id,
+            original_prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
         )
-        req_state.stage_submit_ts[stage_id] = _time.time()
+        req_state.mark_stage_submitted(stage_id, _time.time())
         self.request_states[request_id] = req_state
 
-        # Stage-0 prompt is already a fully-formed OmniEngineCoreRequest
-        # (pre-processed by AsyncOmniEngine.add_request, output processor
-        # already registered there) - submit directly.
         request = prompt
-        stage_client = self.stage_clients[stage_id]
-        if stage_client.stage_type == "diffusion":
-            if isinstance(prompt, list):
-                await stage_client.add_batch_request_async(
-                    request_id,
-                    prompt,
-                    params,
-                )
-            else:
-                await stage_client.add_request_async(request_id, prompt, params)
-        else:
-            await stage_client.add_request_async(request)
+        await self.stage_runtimes[stage_id].submit(
+            request=request,
+            request_id=request_id,
+            params=params,
+        )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
@@ -713,13 +620,13 @@ class Orchestrator:
         if "sampling_params_list" in msg and msg["sampling_params_list"]:
             req_state.sampling_params_list = msg["sampling_params_list"]
 
-        req_state.stage_submit_ts[stage_id] = _time.time()
-        stage_client = self.stage_clients[stage_id]
-        if stage_client.stage_type == "diffusion":
-            params = req_state.sampling_params_list[stage_id]
-            await stage_client.add_request_async(request_id, request, params)
-        else:
-            await stage_client.add_request_async(request)
+        params = req_state.sampling_params_list[stage_id]
+        req_state.mark_stage_submitted(stage_id, _time.time())
+        await self.stage_runtimes[stage_id].submit(
+            request=request,
+            request_id=request_id,
+            params=params,
+        )
 
     async def _prewarm_async_chunk_stages(
         self,
@@ -759,38 +666,36 @@ class Orchestrator:
         base_input["mm_processor_kwargs"] = None
 
         for next_stage_id in range(1, req_state.final_stage_id + 1):
-            next_client = self.stage_clients[next_stage_id]
+            next_runtime = self.stage_runtimes[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
 
-            if next_client.stage_type == "diffusion":
-                source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [next_stage_id - 1])
+            if next_runtime.stage_type == "diffusion":
+                source_stage_ids = list(next_runtime.engine_input_source or [next_stage_id - 1])
                 kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
-                await next_client.add_request_async(
-                    request_id,
-                    req_state.prompt,
-                    params,
+                await next_runtime.submit(
+                    request=req_state.prompt,
+                    request_id=request_id,
+                    params=params,
                     kv_sender_info=kv_sender_info,
                 )
-                req_state.stage_submit_ts[next_stage_id] = _time.time()
+                req_state.mark_stage_submitted(next_stage_id, _time.time())
                 continue
 
             request = build_engine_core_request_from_tokens(
                 request_id=request_id,
                 prompt=base_input,
                 params=params,
-                model_config=self.stage_vllm_configs[next_stage_id].model_config,
+                model_config=next_runtime.stage_vllm_config.model_config,
             )
             request.external_req_id = request.request_id
 
-            self.output_processors[next_stage_id].add_request(
+            next_runtime.register_request(request=request, prompt=None)
+            await next_runtime.submit(
                 request=request,
-                prompt=None,
-                parent_req=None,
-                request_index=0,
-                queue=None,
+                request_id=request_id,
+                params=params,
             )
-            await next_client.add_request_async(request)
-            req_state.stage_submit_ts[next_stage_id] = _time.time()
+            req_state.mark_stage_submitted(next_stage_id, _time.time())
 
     async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -809,17 +714,19 @@ class Orchestrator:
         self._companion_done.setdefault(parent_id, set())
 
         companion_state = OrchestratorRequestState(
-            request_id=companion_id,
-            prompt=companion_prompt,
+            global_request_id=companion_id,
+            original_prompt=companion_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=0,
         )
-        companion_state.stage_submit_ts[0] = _time.time()
+        companion_state.mark_stage_submitted(0, _time.time())
         self.request_states[companion_id] = companion_state
 
-        request = companion_prompt  # Already a processed OmniEngineCoreRequest
-        stage_client = self.stage_clients[0]
-        await stage_client.add_request_async(request)
+        await self.stage_runtimes[0].submit(
+            request=companion_prompt,
+            request_id=companion_id,
+            params=sampling_params_list[0] if sampling_params_list else None,
+        )
 
         logger.info(
             "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s)",
@@ -839,15 +746,22 @@ class Orchestrator:
                 companion_ids_to_abort.append(cid)
                 self._companion_ids.discard(cid)
                 self._companion_to_parent.pop(cid, None)
-                self.request_states.pop(cid, None)
             self._companion_done.pop(req_id, None)
             self._deferred_parents.pop(req_id, None)
 
         all_ids_to_abort = list(request_ids) + companion_ids_to_abort
-        for stage_id in range(self.num_stages):
-            await self.stage_clients[stage_id].abort_requests_async(all_ids_to_abort)
+        for runtime in self.stage_runtimes:
+            await runtime.abort(all_ids_to_abort)
         for req_id in request_ids:
+            req_state = self.request_states.get(req_id)
+            if req_state is not None:
+                req_state.cancel()
             self.request_states.pop(req_id, None)
+        for companion_id in companion_ids_to_abort:
+            companion_state = self.request_states.get(companion_id)
+            if companion_state is not None:
+                companion_state.cancel()
+            self.request_states.pop(companion_id, None)
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
 
     async def _handle_collective_rpc(self, msg: dict[str, Any]) -> None:
@@ -877,21 +791,13 @@ class Orchestrator:
                 )
                 continue
 
-            stage_client = self.stage_clients[stage_id]
             try:
-                if hasattr(stage_client, "collective_rpc_async"):
-                    stage_result = await stage_client.collective_rpc_async(
-                        method=method,
-                        timeout=timeout,
-                        args=args,
-                        kwargs=kwargs,
-                    )
-                else:
-                    stage_result = {
-                        "supported": False,
-                        "todo": True,
-                        "reason": (f"{stage_client.__class__.__name__}.collective_rpc_async is not implemented yet"),
-                    }
+                stage_result = await self.stage_runtimes[stage_id].collective_rpc(
+                    method=method,
+                    timeout=timeout,
+                    args=args,
+                    kwargs=kwargs,
+                )
             except Exception as exc:
                 logger.exception(
                     "[Orchestrator] collective_rpc failed: stage=%s method=%s",
@@ -922,9 +828,9 @@ class Orchestrator:
 
         self._stages_shutdown = True
         logger.info("[Orchestrator] Shutting down all stages")
-        for stage_id, stage_client in enumerate(self.stage_clients):
+        for stage_id, runtime in enumerate(self.stage_runtimes):
             try:
-                stage_client.shutdown()
+                runtime.shutdown()
                 logger.info(f"[Orchestrator] Stage {stage_id} shut down")
             except Exception as e:
                 logger.warning(f"[Orchestrator] Failed to shutdown stage {stage_id}: {e}")

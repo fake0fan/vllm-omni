@@ -937,6 +937,25 @@ class AsyncOmniEngine:
 
     # ---- request helpers ----
 
+    def _register_stage0_request(
+        self,
+        *,
+        request: EngineCoreRequest,
+        prompt_text: str | None,
+        original_prompt: Any,
+    ) -> None:
+        """Register a caller-thread stage-0 request with the stage-0 output processor."""
+        output_prompt_text = prompt_text
+        if output_prompt_text is None and isinstance(original_prompt, dict):
+            output_prompt_text = original_prompt.get("prompt")
+        self.output_processors[0].add_request(
+            request=request,
+            prompt=output_prompt_text,
+            parent_req=None,
+            request_index=0,
+            queue=None,
+        )
+
     def _build_add_request_message(
         self,
         request_id: str,
@@ -955,7 +974,13 @@ class AsyncOmniEngine:
         resumable: bool = False,
         message_type: str = "add_request",
     ) -> dict[str, Any]:
-        """Build an add_request message after stage-0 preprocessing."""
+        """Build an add_request message after caller-thread stage-0 preprocessing.
+
+        PR1 keeps the AsyncOmniEngine compatibility boundary explicit:
+        stage-0 input processing and stage-0 output-processor registration
+        intentionally still happen in the caller thread. This temporary
+        boundary stays in place until PR2 extracts the bootstrap/runtime split.
+        """
         effective_sampling_params_list = (
             list(sampling_params_list) if sampling_params_list is not None else list(self.default_sampling_params_list)
         )
@@ -1008,16 +1033,10 @@ class AsyncOmniEngine:
             request.external_req_id = request_id
             request = _apply_omni_final_stage_metadata(request, final_stage_id)
 
-            # Register with stage 0's output processor.
-            output_prompt_text = prompt_text
-            if output_prompt_text is None and isinstance(original_prompt, dict):
-                output_prompt_text = original_prompt.get("prompt")
-            self.output_processors[0].add_request(
+            self._register_stage0_request(
                 request=request,
-                prompt=output_prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
+                prompt_text=prompt_text,
+                original_prompt=original_prompt,
             )
             prompt = request
 

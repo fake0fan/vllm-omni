@@ -5,6 +5,7 @@ import pytest
 from vllm import SamplingParams
 
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.stage_runtime import build_stage_runtimes
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -12,6 +13,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummySenderStage:
+    stage_type = "llm"
+    stage_id = 0
+    final_output = False
+
     def __init__(self, sender_info):
         self._sender_info = sender_info
         self.engine_outputs = None
@@ -26,14 +31,29 @@ class _DummySenderStage:
 class _DummyDiffusionStage:
     stage_type = "diffusion"
     custom_process_input_func = None
+    final_output = True
 
-    def __init__(self, engine_input_source=None):
+    def __init__(self, *, stage_id=1, engine_input_source=None, custom_process_input_func=None):
+        self.stage_id = stage_id
         self.engine_input_source = engine_input_source or [0]
+        self.custom_process_input_func = custom_process_input_func
         self.calls = []
 
     async def add_request_async(self, request_id, prompt, sampling_params, kv_sender_info=None):
         self.calls.append(
             {
+                "method": "single",
+                "request_id": request_id,
+                "prompt": prompt,
+                "sampling_params": sampling_params,
+                "kv_sender_info": kv_sender_info,
+            }
+        )
+
+    async def add_batch_request_async(self, request_id, prompt, sampling_params, kv_sender_info=None):
+        self.calls.append(
+            {
+                "method": "batch",
                 "request_id": request_id,
                 "prompt": prompt,
                 "sampling_params": sampling_params,
@@ -126,18 +146,23 @@ def test_stage_engine_core_client_preserves_explicit_loopback_sender_host():
 def test_forward_to_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     sender_stage = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50151})
-    diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
+    diffusion_stage = _DummyDiffusionStage(stage_id=1, engine_input_source=[0])
 
     orchestrator.num_stages = 2
-    orchestrator.stage_clients = [sender_stage, diffusion_stage]
+    orchestrator.stage_runtimes = build_stage_runtimes(
+        stage_clients=[sender_stage, diffusion_stage],
+        output_processors=[SimpleNamespace(add_request=lambda **_kwargs: None), None],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)), None],
+    )
+    orchestrator.stage_clients = [runtime.stage_client for runtime in orchestrator.stage_runtimes]
     orchestrator._companion_map = {}
     orchestrator.stage_vllm_configs = [None, None]
     orchestrator.output_processors = [None, None]
 
     params = OmniDiffusionSamplingParams()
     req_state = OrchestratorRequestState(
-        request_id="req-1",
-        prompt={"prompt": "hello"},
+        global_request_id="req-1",
+        original_prompt={"prompt": "hello"},
         sampling_params_list=[SamplingParams(max_tokens=4), params],
         final_stage_id=1,
     )
@@ -156,19 +181,34 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
 def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     source_stage = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50151})
+    source_stage.stage_id = 0
     previous_stage = _DummySenderStage({"host": "10.0.0.9", "zmq_port": 59999})
-    diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
+    previous_stage.stage_id = 1
+    diffusion_stage = _DummyDiffusionStage(stage_id=2, engine_input_source=[0])
 
     orchestrator.num_stages = 3
-    orchestrator.stage_clients = [source_stage, previous_stage, diffusion_stage]
+    orchestrator.stage_runtimes = build_stage_runtimes(
+        stage_clients=[source_stage, previous_stage, diffusion_stage],
+        output_processors=[
+            SimpleNamespace(add_request=lambda **_kwargs: None),
+            SimpleNamespace(add_request=lambda **_kwargs: None),
+            None,
+        ],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            None,
+        ],
+    )
+    orchestrator.stage_clients = [runtime.stage_client for runtime in orchestrator.stage_runtimes]
     orchestrator._companion_map = {}
     orchestrator.stage_vllm_configs = [None, None, None]
     orchestrator.output_processors = [None, None, None]
 
     params = OmniDiffusionSamplingParams()
     req_state = OrchestratorRequestState(
-        request_id="req-3",
-        prompt={"prompt": "hello"},
+        global_request_id="req-3",
+        original_prompt={"prompt": "hello"},
         sampling_params_list=[SamplingParams(max_tokens=4), SamplingParams(max_tokens=4), params],
         final_stage_id=2,
     )
@@ -182,17 +222,66 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     }
 
 
+def test_forward_to_diffusion_preserves_batch_prompt_from_custom_process_input_func():
+    orchestrator = object.__new__(Orchestrator)
+    sender_stage = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50151})
+    diffusion_stage = _DummyDiffusionStage(
+        stage_id=1,
+        engine_input_source=[0],
+        custom_process_input_func=lambda *_args: [
+            {"prompt": "frame-1"},
+            {"prompt": "frame-2"},
+        ],
+    )
+
+    orchestrator.num_stages = 2
+    orchestrator.stage_runtimes = build_stage_runtimes(
+        stage_clients=[sender_stage, diffusion_stage],
+        output_processors=[SimpleNamespace(add_request=lambda **_kwargs: None), None],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)), None],
+    )
+    assert orchestrator.stage_runtimes[1].custom_process_input_func is not None
+    orchestrator.stage_clients = [runtime.stage_client for runtime in orchestrator.stage_runtimes]
+    orchestrator._companion_map = {}
+    orchestrator.stage_vllm_configs = [None, None]
+    orchestrator.output_processors = [None, None]
+
+    params = OmniDiffusionSamplingParams()
+    req_state = OrchestratorRequestState(
+        global_request_id="req-batch",
+        original_prompt={"prompt": "hello"},
+        sampling_params_list=[SamplingParams(max_tokens=4), params],
+        final_stage_id=1,
+    )
+
+    output = SimpleNamespace(request_id="req-batch", finished=True)
+    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-batch", 0, output, req_state))
+
+    assert diffusion_stage.calls[0]["method"] == "batch"
+    assert diffusion_stage.calls[0]["prompt"] == [
+        {"prompt": "frame-1"},
+        {"prompt": "frame-2"},
+    ]
+
+
 def test_prewarm_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     sender_stage = _DummySenderStage({"host": "10.0.0.3", "zmq_port": 50151})
-    diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
+    diffusion_stage = _DummyDiffusionStage(stage_id=1, engine_input_source=[0])
 
-    orchestrator.stage_clients = [sender_stage, diffusion_stage]
     orchestrator.num_stages = 2
+    orchestrator.stage_runtimes = build_stage_runtimes(
+        stage_clients=[sender_stage, diffusion_stage],
+        output_processors=[SimpleNamespace(add_request=lambda **_kwargs: None), None],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)), None],
+    )
+    orchestrator.stage_clients = [runtime.stage_client for runtime in orchestrator.stage_runtimes]
+    orchestrator.output_processors = [runtime.output_processor for runtime in orchestrator.stage_runtimes]
+    orchestrator.stage_vllm_configs = [runtime.stage_vllm_config for runtime in orchestrator.stage_runtimes]
 
     req_state = OrchestratorRequestState(
-        request_id="req-2",
-        prompt={"prompt": "hello"},
+        global_request_id="req-2",
+        original_prompt={"prompt": "hello"},
         sampling_params_list=[SamplingParams(max_tokens=4), OmniDiffusionSamplingParams()],
         final_stage_id=1,
     )

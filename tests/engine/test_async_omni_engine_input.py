@@ -59,7 +59,40 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     assert request.additional_information is not None
     assert request.additional_information.entries["text"].list_data == ["hello world"]
     assert request.additional_information.entries["speaker"].list_data == ["vivian"]
-    output_processor.add_request.assert_called_once()
+    assert msg["original_prompt"]["additional_information"]["global_request_id"] == ["req-1"]
+    output_processor.add_request.assert_called_once_with(
+        request=request,
+        prompt=None,
+        parent_req=None,
+        request_index=0,
+        queue=None,
+    )
+
+
+def test_register_stage0_request_uses_original_prompt_text_fallback(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    output_processor = mocker.Mock()
+    engine.output_processors = [output_processor]
+
+    request = _make_engine_core_request()
+    original_prompt = {
+        "prompt": "hello from original prompt",
+        "prompt_token_ids": [1, 1, 1],
+    }
+
+    engine._register_stage0_request(
+        request=request,
+        prompt_text=None,
+        original_prompt=original_prompt,
+    )
+
+    output_processor.add_request.assert_called_once_with(
+        request=request,
+        prompt="hello from original prompt",
+        parent_req=None,
+        request_index=0,
+        queue=None,
+    )
 
 
 def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixture):

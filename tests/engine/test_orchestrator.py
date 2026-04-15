@@ -35,11 +35,13 @@ class FakeStageClient:
     def __init__(
         self,
         *,
+        stage_id: int | None = None,
         stage_type: str = "llm",
         final_output: bool = False,
         final_output_type: str = "text",
         next_inputs: list[dict] | None = None,
     ) -> None:
+        self.stage_id = stage_id
         self.stage_type = stage_type
         self.final_output = final_output
         self.final_output_type = final_output_type
@@ -55,11 +57,14 @@ class FakeStageClient:
     async def add_request_async(self, *args, **_kwargs) -> None:
         self.add_request_calls.append(args)
 
+    async def add_batch_request_async(self, *args, **_kwargs) -> None:
+        self.add_request_calls.append(args)
+
     async def get_output_async(self):
         try:
             return self._engine_core_outputs.get_nowait()
         except queue.Empty:
-            return SimpleNamespace(outputs=[])
+            return SimpleNamespace(outputs=[], scheduler_stats=None)
 
     def get_diffusion_output_nowait(self):
         try:
@@ -148,6 +153,10 @@ def _build_harness(
     stage_vllm_configs: list[object] | None = None,
     async_chunk: bool = False,
 ) -> OrchestratorFixture:
+    for stage_id, stage_client in enumerate(stage_clients):
+        if getattr(stage_client, "stage_id", None) is None:
+            setattr(stage_client, "stage_id", stage_id)
+
     if output_processors is None:
         output_processors = [FakeOutputProcessor() for _ in stage_clients]
     if stage_vllm_configs is None:
@@ -330,6 +339,72 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         assert output_msg["finished"] is True
         assert output_msg["engine_outputs"].request_id == "req-llm"
         assert "req-llm" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_run_two_stage_llm_with_non_dense_client_stage_ids(orchestrator_factory) -> None:
+    stage0 = FakeStageClient(stage_id=7, stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(
+        stage_id=11,
+        stage_type="llm",
+        final_output=True,
+        next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
+    )
+    processors = [
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-stage-ids", token_ids=[3, 4], finished=True)]),
+        FakeOutputProcessor(
+            request_outputs=[_build_request_output("req-stage-ids", token_ids=[10, 11], finished=True)]
+        ),
+    ]
+    orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
+    request = SimpleNamespace(request_id="req-stage-ids", prompt_token_ids=[1, 2, 3])
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-stage-ids",
+            prompt=request,
+            original_prompt={"prompt": "hello"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage1_request = stage1.add_request_calls[0][0]
+        assert stage1_request.request_id == "req-stage-ids"
+        assert stage1_request.prompt_token_ids == [7, 8, 9]
+
+        stage1.push_engine_core_outputs(_engine_core_outputs("stage1-raw", 2.0))
+
+        output_msg = await _get_output_message(orchestrator_fixture)
+
+        assert output_msg["request_id"] == "req-stage-ids"
+        assert output_msg["stage_id"] == 1
+        assert output_msg["finished"] is True
+        assert output_msg["engine_outputs"].request_id == "req-stage-ids"
+        assert "req-stage-ids" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_builds_stage_runtimes(orchestrator_factory) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    orchestrator_fixture = orchestrator_factory([stage0, stage1])
+
+    try:
+        assert hasattr(orchestrator_fixture.orchestrator, "stage_runtimes")
+        assert [runtime.stage_type for runtime in orchestrator_fixture.orchestrator.stage_runtimes] == [
+            "llm",
+            "diffusion",
+        ]
+        assert [runtime.stage_client for runtime in orchestrator_fixture.orchestrator.stage_runtimes] == [stage0, stage1]
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
