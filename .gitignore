@@ -175,6 +175,7 @@ CLAUDE.md
 # Codex
 AGENTS.md
 .codex/
+/.worktrees/
 
 # cursor
 .cursor/
