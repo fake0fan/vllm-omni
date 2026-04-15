@@ -543,6 +543,125 @@ def test_add_request_ignores_cfg_expansion_hook_failure_and_keeps_parent_live() 
     assert runtime._deferred_parents == {}
 
 
+def test_add_request_cfg_expansion_hook_sees_pre_ingress_prompt_snapshot() -> None:
+    runtime = object.__new__(PipelineRuntime)
+    seen_prompt = {}
+
+    async def _accept_external_request(*, meta, data):
+        data.raw_prompt.setdefault("additional_information", {})["global_request_id"] = [meta.request_id]
+        data.stage0_request = {"request_id": meta.request_id}
+        return data.stage0_request
+
+    def _expand(prompt, entry_params):
+        seen_prompt["prompt"] = prompt
+        return []
+
+    stage0_params = SamplingParams(max_tokens=8, temperature=0.9)
+    downstream_params = SamplingParams(max_tokens=16)
+    original_prompt = {"prompt": "parent prompt"}
+
+    runtime.entry_runtime = SimpleNamespace(accept_external_request=_accept_external_request)
+    runtime.entry_stage_pos = 0
+    runtime.entry_stage_id = 5
+    runtime._entry_uses_prebuilt_request = False
+    runtime.prompt_expand_func = _expand
+    runtime.request_states = {}
+    runtime.stage_runtimes = []
+    runtime._companion_map = {}
+    runtime._companion_ids = set()
+    runtime._companion_to_parent = {}
+    runtime._companion_done = {}
+    runtime._deferred_parents = {}
+    runtime.async_chunk = False
+
+    asyncio.run(
+        PipelineRuntime._handle_add_request(
+            runtime,
+            {
+                "request_id": "req-parent",
+                "prompt": {"prompt": "parent prompt"},
+                "original_prompt": original_prompt,
+                "sampling_params_list": [stage0_params, downstream_params],
+                "final_stage_id": 1,
+            },
+        )
+    )
+
+    assert seen_prompt["prompt"] == {"prompt": "parent prompt"}
+    assert "additional_information" not in seen_prompt["prompt"]
+    assert runtime.request_states["req-parent"].data.raw_prompt["additional_information"]["global_request_id"] == [
+        "req-parent"
+    ]
+
+
+def test_add_request_cleans_up_parent_when_cfg_expansion_object_fails() -> None:
+    runtime = object.__new__(PipelineRuntime)
+    output_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    abort_calls: list[list[str]] = []
+
+    async def _accept_external_request(*, meta, data):
+        data.stage0_request = {"request_id": meta.request_id}
+        return data.stage0_request
+
+    async def _abort(request_ids):
+        abort_calls.append(list(request_ids))
+
+    stage0_params = SamplingParams(max_tokens=8, temperature=0.9)
+    downstream_params = SamplingParams(max_tokens=16)
+
+    def _bad_apply_overrides(entry_params, sampling_params_list):
+        raise RuntimeError("bad companion overrides")
+
+    expansion = SimpleNamespace(
+        request_id_suffix="-neg",
+        prompt={"prompt": "negative prompt"},
+        role="negative",
+        apply_overrides=_bad_apply_overrides,
+    )
+
+    runtime.output_async_queue = output_queue
+    runtime.entry_runtime = SimpleNamespace(accept_external_request=_accept_external_request)
+    runtime.entry_stage_pos = 0
+    runtime.entry_stage_id = 5
+    runtime._entry_uses_prebuilt_request = False
+    runtime.prompt_expand_func = lambda prompt, entry_params: [expansion]
+    runtime.request_states = {}
+    runtime.stage_runtimes = [SimpleNamespace(abort=_abort)]
+    runtime._companion_map = {}
+    runtime._companion_ids = set()
+    runtime._companion_to_parent = {}
+    runtime._companion_done = {}
+    runtime._deferred_parents = {}
+    runtime.async_chunk = False
+
+    asyncio.run(
+        PipelineRuntime._handle_add_request(
+            runtime,
+            {
+                "request_id": "req-parent",
+                "prompt": {"prompt": "parent prompt"},
+                "original_prompt": {"prompt": "parent prompt"},
+                "sampling_params_list": [stage0_params, downstream_params],
+                "final_stage_id": 1,
+            },
+        )
+    )
+
+    assert abort_calls == [["req-parent"]]
+    assert runtime.request_states == {}
+    assert runtime._companion_map == {}
+    assert runtime._companion_ids == set()
+    assert runtime._companion_to_parent == {}
+    assert runtime._companion_done == {}
+    assert runtime._deferred_parents == {}
+    assert output_queue.get_nowait() == {
+        "type": "error",
+        "request_id": "req-parent",
+        "stage_id": 0,
+        "error": "bad companion overrides",
+    }
+
+
 def test_streaming_update_entry_failure_aborts_parent_and_live_companions() -> None:
     runtime = object.__new__(PipelineRuntime)
     output_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()

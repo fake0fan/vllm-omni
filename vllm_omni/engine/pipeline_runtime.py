@@ -649,14 +649,18 @@ class PipelineRuntime:
         await self._cleanup_failed_entry_request(request_id)
         await self._emit_request_error(request_id, error)
 
-    async def _maybe_expand_cfg_companions(self, req_state: PipelineRequestState) -> bool:
+    async def _maybe_expand_cfg_companions(
+        self,
+        req_state: PipelineRequestState,
+        original_prompt_snapshot: Any,
+    ) -> bool:
         if self.prompt_expand_func is None:
             return True
         if self.entry_stage_pos is None or req_state.final_stage_id <= self.entry_stage_pos:
             return True
 
         try:
-            expanded = self.prompt_expand_func(req_state.data.raw_prompt, req_state.meta.entry_params)
+            expanded = self.prompt_expand_func(original_prompt_snapshot, req_state.meta.entry_params)
         except Exception:
             logger.exception("[Orchestrator] prompt_expand_func failed for req %s", req_state.request_id)
             return True
@@ -664,24 +668,28 @@ class PipelineRuntime:
         if not expanded:
             return True
 
-        for ep in expanded:
-            _companion_params, companion_spl = ep.apply_overrides(
-                req_state.meta.entry_params,
-                req_state.meta.sampling_params_list,
-            )
-            companion_prompt = _clone_prompt_for_runtime_ownership(ep.prompt)
-            await self._handle_add_companion(
-                {
-                    "companion_id": f"{req_state.request_id}{ep.request_id_suffix}",
-                    "parent_id": req_state.request_id,
-                    "role": ep.role,
-                    "prompt": companion_prompt,
-                    "original_prompt": companion_prompt,
-                    "sampling_params_list": companion_spl,
-                }
-            )
-            if req_state.request_id not in self.request_states:
-                return False
+        try:
+            for ep in expanded:
+                _companion_params, companion_spl = ep.apply_overrides(
+                    req_state.meta.entry_params,
+                    req_state.meta.sampling_params_list,
+                )
+                companion_prompt = _clone_prompt_for_runtime_ownership(ep.prompt)
+                await self._handle_add_companion(
+                    {
+                        "companion_id": f"{req_state.request_id}{ep.request_id_suffix}",
+                        "parent_id": req_state.request_id,
+                        "role": ep.role,
+                        "prompt": companion_prompt,
+                        "original_prompt": companion_prompt,
+                        "sampling_params_list": companion_spl,
+                    }
+                )
+                if req_state.request_id not in self.request_states:
+                    return False
+        except Exception as error:
+            await self._handle_entry_request_error(req_state.request_id, error)
+            return False
 
         logger.info(
             "[Orchestrator] CFG expansion for req %s: %d companions",
@@ -698,6 +706,7 @@ class PipelineRuntime:
         request_id = msg["request_id"]
         prompt = msg["prompt"]
         original_prompt = msg.get("original_prompt", prompt)
+        expansion_prompt_snapshot = _clone_prompt_for_runtime_ownership(original_prompt)
         sampling_params_list = msg["sampling_params_list"]
         if not sampling_params_list:
             raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
@@ -752,7 +761,7 @@ class PipelineRuntime:
             await self._handle_entry_request_error(request_id, error)
             return
 
-        if not await self._maybe_expand_cfg_companions(req_state):
+        if not await self._maybe_expand_cfg_companions(req_state, expansion_prompt_snapshot):
             return
 
         if self.async_chunk and final_stage_id > self.entry_stage_pos:
