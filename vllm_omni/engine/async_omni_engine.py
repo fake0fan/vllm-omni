@@ -753,12 +753,23 @@ class AsyncOmniEngine:
 
                         with llm_stage_launch_lock:
                             previous_visible_devices = os.environ.get(device_control_env)
+                            lock_fds: list[int] = []
                             try:
                                 setup_stage_devices(configured_stage_id, metadata.runtime_cfg)
                                 omni_conn_cfg, omni_from, omni_to = omni_kv_connector
                                 if omni_conn_cfg:
                                     inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
                                 inject_kv_stage_info(stage_cfg, configured_stage_id, self.stage_configs)
+                                engine_args_dict = build_engine_args_dict(
+                                    stage_cfg,
+                                    self.model,
+                                    stage_connector_spec=stage_connector_spec,
+                                )
+                                lock_fds = acquire_device_locks(
+                                    configured_stage_id,
+                                    engine_args_dict,
+                                    stage_init_timeout,
+                                )
                                 if self.single_stage_mode:
                                     assert self._omni_master_server is not None
                                     stage_clients[stage_idx] = self._launch_diffusion_stage(
@@ -781,7 +792,11 @@ class AsyncOmniEngine:
                                     configured_stage_id,
                                     self.diffusion_batch_size,
                                 )
+                                release_device_locks(lock_fds)
+                                lock_fds = []
                             finally:
+                                if lock_fds:
+                                    release_device_locks(lock_fds)
                                 if previous_visible_devices is None:
                                     current_omni_platform.unset_device_control_env_var()
                                 else:

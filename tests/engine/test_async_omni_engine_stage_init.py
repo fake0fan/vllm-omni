@@ -171,6 +171,81 @@ def test_initialize_stages_passes_stage_init_timeout_to_diffusion_handshake(monk
     assert captured_timeout == 302
 
 
+def test_initialize_stages_acquires_device_locks_for_diffusion_stage(monkeypatch):
+    """Regression test for diffusion stage device-lock coordination."""
+    import vllm_omni.engine.async_omni_engine as engine_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.log_stats = False
+    engine.model = "dummy-model"
+    engine.config_path = "dummy-config"
+    engine.num_stages = 1
+    engine.async_chunk = False
+    engine.diffusion_batch_size = 1
+    engine.single_stage_mode = False
+    engine._single_stage_id_filter = None
+    engine._omni_master_server = None
+    engine.stage_configs = [types.SimpleNamespace(stage_id=0, stage_type="diffusion", engine_args={})]
+
+    metadata = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="diffusion",
+        runtime_cfg={"devices": "0"},
+        prompt_expand_func=None,
+        final_output=True,
+        final_output_type="image",
+        default_sampling_params=None,
+        custom_process_input_func=None,
+        engine_input_source=None,
+        cfg_kv_collect_func=None,
+    )
+    diffusion_client = types.SimpleNamespace(is_comprehension=False)
+    captured_lock_args = []
+    released_lock_fds = []
+
+    device_env_var = current_omni_platform.device_control_env_var
+    prev_device_env = os.environ.get(device_env_var)
+    os.environ[device_env_var] = "0"
+
+    monkeypatch.setattr(engine_mod, "prepare_engine_environment", lambda: None)
+    monkeypatch.setattr(engine_mod, "load_omni_transfer_config_for_model", lambda *_: None)
+    monkeypatch.setattr(engine_mod, "extract_stage_metadata", lambda _cfg: metadata)
+    monkeypatch.setattr(engine_mod, "get_stage_connector_spec", lambda **_: {})
+    monkeypatch.setattr(engine_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
+    monkeypatch.setattr(engine_mod, "setup_stage_devices", lambda *_: None)
+    monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
+    monkeypatch.setattr(engine_mod, "build_engine_args_dict", lambda *_, **__: {"tensor_parallel_size": 1})
+
+    def _capture_device_locks(stage_id, engine_args_dict, stage_init_timeout):
+        captured_lock_args.append((stage_id, dict(engine_args_dict), stage_init_timeout))
+        return [101]
+
+    monkeypatch.setattr(engine_mod, "acquire_deviccleare_locks", _capture_device_locks)
+    monkeypatch.setattr(engine_mod, "release_device_locks", lambda lock_fds: released_lock_fds.extend(lock_fds))
+    monkeypatch.setattr(engine_mod, "initialize_diffusion_stage", lambda *_, **__: diffusion_client)
+    monkeypatch.setattr(
+        engine_mod,
+        "finalize_initialized_stages",
+        lambda stage_clients, _input_processor: (
+            stage_clients,
+            [types.SimpleNamespace()],
+            [{"final_output_type": "image"}],
+        ),
+    )
+
+    try:
+        engine._initialize_stages(stage_init_timeout=302)
+    finally:
+        if prev_device_env is None:
+            os.environ.pop(device_env_var, None)
+        else:
+            os.environ[device_env_var] = prev_device_env
+
+    assert captured_lock_args == [(0, {"tensor_parallel_size": 1}, 302)]
+    assert released_lock_fds == [101]
+
+
 def test_launch_llm_stage_passes_stage_init_timeout_to_complete_stage_handshake(monkeypatch):
     """Regression test for stage_init_timeout reaching complete_stage_handshake
     in the LLM stage path.
