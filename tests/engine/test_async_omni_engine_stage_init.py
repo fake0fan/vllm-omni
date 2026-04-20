@@ -221,7 +221,7 @@ def test_initialize_stages_acquires_device_locks_for_diffusion_stage(monkeypatch
         captured_lock_args.append((stage_id, dict(engine_args_dict), stage_init_timeout))
         return [101]
 
-    monkeypatch.setattr(engine_mod, "acquire_deviccleare_locks", _capture_device_locks)
+    monkeypatch.setattr(engine_mod, "acquire_device_locks", _capture_device_locks)
     monkeypatch.setattr(engine_mod, "release_device_locks", lambda lock_fds: released_lock_fds.extend(lock_fds))
     monkeypatch.setattr(engine_mod, "initialize_diffusion_stage", lambda *_, **__: diffusion_client)
     monkeypatch.setattr(
