@@ -940,12 +940,42 @@ class TestQwen3TTSPipeline:
         # Stage 1 uses its per-stage override
         assert stages[1].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
 
+    def test_subtalker_sampling_params_deep_merge_preserves_base_keys(self):
+        """Verify subtalker sampling params participate in stage deep-merge."""
+        from vllm_omni.config.stage_config import _deep_merge_stage
+
+        base = {
+            "stage_id": 0,
+            "subtalker_sampling_params": {
+                "do_sample": True,
+                "temperature": 0.9,
+                "top_k": 50,
+                "top_p": 1.0,
+            },
+        }
+        overlay = {
+            "stage_id": 0,
+            "subtalker_sampling_params": {
+                "temperature": 0.7,
+                "top_k": 32,
+            },
+        }
+
+        merged = _deep_merge_stage(base, overlay)
+
+        assert merged["subtalker_sampling_params"] == {
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_k": 32,
+            "top_p": 1.0,
+        }
+
 
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
 
     def test_ci_inherits_from_main(self):
-        from tests.utils import get_deploy_config_path
+        from tests.helpers.stage_config import get_deploy_config_path
         from vllm_omni.config.stage_config import load_deploy_config
 
         ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe.yaml"))
@@ -962,12 +992,12 @@ class TestBaseConfigInheritance:
         assert deploy.connectors is not None
         assert "connector_of_shared_memory" in deploy.connectors
         # CI overlay explicitly sets async_chunk: False (see
-        # tests/utils.py::_CI_OVERLAYS and PR #2383 discussion). Overlay
+        # tests.helpers.stage_config._CI_OVERLAYS and PR #2383 discussion). Overlay
         # bool overrides base even when the base yaml has async_chunk: true.
         assert deploy.async_chunk is False
 
     def test_ci_sampling_merge(self):
-        from tests.utils import get_deploy_config_path
+        from tests.helpers.stage_config import get_deploy_config_path
         from vllm_omni.config.stage_config import load_deploy_config
 
         ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe.yaml"))
