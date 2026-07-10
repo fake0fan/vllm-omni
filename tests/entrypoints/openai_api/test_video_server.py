@@ -123,23 +123,33 @@ def isolated_video_backends(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch):
     events: list[str] = []
+    app_build: dict[str, object] = {}
     serve_started = asyncio.Event()
     http_shutdown = asyncio.Event()
     engine_context_exited = asyncio.Event()
     sock = FakeServerSocket()
+    model_config = object()
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=SimpleNamespace(_api_process_rank=0),
+    )
 
     class FakeEngine:
-        stage_configs = []
+        stage_configs = [{"stage_type": "llm"}]
+        model_config = None
 
         async def get_supported_tasks(self):
             return ("generate",)
+
+    fake_engine = FakeEngine()
+    fake_engine.model_config = model_config
 
     @asynccontextmanager
     async def fake_build_async_omni(*args, **kwargs):
         del args, kwargs
         events.append("engine_enter")
         try:
-            yield FakeEngine()
+            yield fake_engine
         finally:
             events.append("engine_exit")
             engine_context_exited.set()
@@ -160,14 +170,29 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
 
     async def fake_get_vllm_config(engine_client):
         del engine_client
-        return None
+        return vllm_config
 
     async def fake_init_app_state(engine_client, state, args):
         del engine_client, state, args
         events.append("init_app_state")
 
+    def fake_build_omni_app(
+        args,
+        supported_tasks,
+        received_model_config,
+        *,
+        is_pure_diffusion,
+        enable_profiler,
+    ):
+        del args
+        app_build["supported_tasks"] = supported_tasks
+        app_build["model_config"] = received_model_config
+        app_build["is_pure_diffusion"] = is_pure_diffusion
+        app_build["enable_profiler"] = enable_profiler
+        return FastAPI()
+
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
-    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
+    monkeypatch.setattr(api_server, "_build_omni_app", fake_build_omni_app)
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
     monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
@@ -202,6 +227,10 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
     await asyncio.wait_for(worker_task, timeout=2)
 
     assert sock.closed
+    assert app_build["supported_tasks"] == ("generate",)
+    assert app_build["model_config"] is model_config
+    assert app_build["is_pure_diffusion"] is False
+    assert app_build["enable_profiler"] is False
     assert events.index("http_shutdown") < events.index("engine_exit")
 
 

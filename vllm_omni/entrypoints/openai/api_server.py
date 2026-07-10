@@ -18,18 +18,19 @@ from contextlib import asynccontextmanager
 from http import HTTPStatus
 from numbers import Integral
 from pathlib import Path
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, cast, get_args
 
 import httpx
 import numpy as np
 import vllm.envs as envs
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 from starlette.datastructures import State
 from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
+from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import load_chat_template
@@ -85,7 +86,7 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import init_logger
-from vllm.tasks import POOLING_TASKS
+from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils import random_uuid
 from vllm.utils.system_utils import decorate_logs
@@ -434,6 +435,94 @@ class _DiffusionServingModels:
 # Server entry points
 
 
+_UPSTREAM_ROUTES_REPLACED_BY_OMNI = (
+    ("GET", "/health"),
+    ("GET", "/v1/models"),
+    ("POST", "/v1/chat/completions"),
+)
+
+_UPSTREAM_ROUTES_UNSUPPORTED_BY_OMNI = (
+    ("POST", "/generative_scoring"),
+    ("POST", "/is_scaling_elastic_ep"),
+    ("POST", "/scale_elastic_ep"),
+    ("POST", "/v1/chat/completions/batch"),
+)
+
+_UPSTREAM_PROFILER_ROUTES = (
+    ("POST", "/start_profile"),
+    ("POST", "/stop_profile"),
+)
+
+_UPSTREAM_ROUTES_UNSUPPORTED_IN_PURE_DIFFUSION = (
+    ("POST", "/detokenize"),
+    ("POST", "/tokenize"),
+)
+
+_OMNI_ROUTES_REQUIRING_GENERATE = (("POST", "/v1/chat/completions"),)
+
+_VLLM_SUPPORTED_TASKS = frozenset(get_args(SupportedTask))
+
+
+def _get_upstream_supported_tasks(
+    supported_tasks: tuple[str, ...],
+    *,
+    is_pure_diffusion: bool,
+) -> tuple[SupportedTask, ...]:
+    if is_pure_diffusion:
+        # Passing Omni's fallback "generate" capability to upstream would
+        # register LLM routes whose serving state cannot be initialized.
+        return ()
+
+    return tuple(cast(SupportedTask, task) for task in supported_tasks if task in _VLLM_SUPPORTED_TASKS)
+
+
+def _remove_routes(app: FastAPI, routes: tuple[tuple[str, str], ...]) -> None:
+    for method, path in routes:
+        _remove_route_from_app(app, path, {method})
+
+
+def _is_pure_diffusion(stage_configs: list | None) -> bool:
+    return bool(stage_configs) and all(get_stage_type(stage) == "diffusion" for stage in stage_configs)
+
+
+def _build_omni_app(
+    args: Namespace,
+    supported_tasks: tuple[str, ...],
+    model_config: ModelConfig | None,
+    *,
+    is_pure_diffusion: bool,
+    enable_profiler: bool,
+) -> FastAPI:
+    """Compose one coherent API surface from upstream and Omni routes.
+
+    Upstream receives only capabilities it understands. Routes that Omni
+    replaces or cannot initialize are removed before the Omni router is added,
+    so every ``(method, path)`` has one owner.
+    """
+    upstream_tasks = _get_upstream_supported_tasks(
+        supported_tasks,
+        is_pure_diffusion=is_pure_diffusion,
+    )
+    app = build_openai_app(args, upstream_tasks, model_config)
+
+    _remove_routes(app, _UPSTREAM_ROUTES_REPLACED_BY_OMNI)
+    _remove_routes(app, _UPSTREAM_ROUTES_UNSUPPORTED_BY_OMNI)
+    if is_pure_diffusion:
+        _remove_routes(app, _UPSTREAM_ROUTES_UNSUPPORTED_IN_PURE_DIFFUSION)
+    if not upstream_tasks:
+        _remove_route_from_app(app, "/invocations", {"POST"})
+
+    app.include_router(router)
+    if "generate" not in supported_tasks:
+        _remove_routes(app, _OMNI_ROUTES_REQUIRING_GENERATE)
+    if enable_profiler:
+        _remove_routes(app, _UPSTREAM_PROFILER_ROUTES)
+        logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
+        app.include_router(profiler_router)
+    _register_omni_exception_handlers(app)
+    return app
+
+
 async def omni_run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server.
 
@@ -495,33 +584,24 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             if not hasattr(engine_client, "get_supported_tasks"):
                 supported_tasks = ("generate",)
 
-        # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
-        app = build_openai_app(args, supported_tasks)
-
-        # OMNI: Remove upstream routes that we override with omni-specific handlers
-        _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
-        _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
-        app.include_router(router)
-
-        # OMNI: Override upstream exception handlers with Omni-aware versions
-        # that understand the multi-stage orchestrator lifecycle.
-        _register_omni_exception_handlers(app)
+        stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+        model_config = engine_client.model_config
+        is_pure_diffusion = _is_pure_diffusion(stage_configs)
+        app = _build_omni_app(
+            args,
+            supported_tasks,
+            model_config,
+            is_pure_diffusion=is_pure_diffusion,
+            enable_profiler=_should_enable_profiler_endpoints(stage_configs),
+        )
 
         await omni_init_app_state(engine_client, app.state, args)
 
         # Start background processes
         await STORAGE_MANAGER.start()
 
-        # Conditionally register profiler endpoints based on stage YAML configs
-        stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
-        if _should_enable_profiler_endpoints(stage_configs):
-            logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
-            app.include_router(profiler_router)
-
         vllm_config = await _get_vllm_config(engine_client)
 
-        # Check if pure diffusion mode (vllm_config will be None)
-        is_pure_diffusion = vllm_config is None
         if is_pure_diffusion:
             logger.info(
                 "Starting vLLM API server (pure diffusion mode) on %s",
@@ -715,15 +795,11 @@ async def omni_init_app_state(
     # Get vllm_config from engine_client (following 0.14.0 pattern)
     vllm_config = await _get_vllm_config(engine_client)
 
-    # Detect if it's pure Diffusion mode (single stage and is Diffusion)
-    is_pure_diffusion = False
-    if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
-        stage_configs = engine_client.stage_configs
-        if len(stage_configs) == 1:
-            stage_type = get_stage_type(stage_configs[0])
-            if stage_type == "diffusion":
-                is_pure_diffusion = True
-                logger.info("Detected pure diffusion mode (single diffusion stage)")
+    # Use the same stage classification as route composition.
+    stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+    is_pure_diffusion = _is_pure_diffusion(stage_configs)
+    if is_pure_diffusion:
+        logger.info("Detected pure diffusion mode")
 
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
