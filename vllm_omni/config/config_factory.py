@@ -31,6 +31,7 @@ from vllm_omni.config.stage_config import (
     merge_pipeline_deploy,
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.io_support import supports_audio_output
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
 logger = init_logger(__name__)
@@ -616,11 +617,13 @@ class StageConfigFactory:
 
         model_class_name = engine_args.get("model_class_name")
         final_output_type = "image"
-        if model_class_name:
-            from vllm_omni.diffusion.io_support import supports_audio_output
-
-            if supports_audio_output(model_class_name):
-                final_output_type = "audio"
+        if model_class_name and supports_audio_output(model_class_name):
+            final_output_type = "audio"
+        logger.info(
+            "Resolved generic diffusion final_output_type=%r for model_class_name=%r.",
+            final_output_type,
+            model_class_name,
+        )
 
         return [
             {
