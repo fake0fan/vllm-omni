@@ -760,9 +760,9 @@ class _DiffusionConfigProjection:
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
         from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
 
-        config_kwargs = normalize_omni_diffusion_kwargs(kwargs)
+        normalized_kwargs = normalize_omni_diffusion_kwargs(kwargs)
         valid_fields = {f.name for f in fields(cast(Any, cls))}
-        return cls(**{k: v for k, v in config_kwargs.items() if k in valid_fields})
+        return cls(**{k: v for k, v in normalized_kwargs.items() if k in valid_fields})
 
     def __post_init__(self) -> None:
         # Keep diffusion imports lazy so importing vllm_omni.config does not
