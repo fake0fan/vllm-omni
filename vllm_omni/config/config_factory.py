@@ -603,6 +603,8 @@ class StageConfigFactory:
         default_sampling_params = dict(raw_sampling_params.get("0", {})) if raw_sampling_params else {}
 
         parallel_config = DiffusionParallelConfig.from_stage_overrides(kwargs)
+        if kwargs.get("num_gpus") is not None:
+            parallel_config.resolve_data_parallel_size(int(kwargs["num_gpus"]))
         engine_args = OmniDiffusionConfig.normalize_init_kwargs(kwargs)
         engine_args["parallel_config"] = asdict(parallel_config)
         engine_args["model_stage"] = "diffusion"
