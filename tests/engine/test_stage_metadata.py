@@ -171,3 +171,45 @@ def test_extract_stage_metadata_defaults_missing_engine_input_source():
     metadata = extract_stage_metadata(legacy_config)
 
     assert metadata.engine_input_source == []
+
+
+def test_runtime_planning_retains_typed_stage_configs(mocker):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    pipeline, deploy = _metadata_inputs()
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=copy.deepcopy(deploy),
+    )
+    typed_configs = list(omni_config.stage_configs)
+    legacy_configs = [stage.to_omegaconf() for stage in merge_pipeline_deploy(pipeline, copy.deepcopy(deploy))]
+    runtime = runtime_mod.StageRuntime(
+        stage_configs=legacy_configs,
+        typed_stage_configs=typed_configs,
+        model="test-model",
+        config_path="test-deploy.yaml",
+        stage_init_timeout=30,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+
+    build_args = mocker.patch.object(runtime_mod, "build_engine_args_dict", return_value={})
+    mocker.patch.object(runtime_mod, "build_vllm_config", return_value=(object(), object))
+    mocker.patch.object(runtime_mod, "get_stage_connector_spec", return_value={})
+    mocker.patch.object(runtime_mod, "resolve_omni_kv_config_for_stage", return_value=(None, None, None))
+
+    plans = runtime._build_logical_stage_init_plans(
+        None,
+        [1, 2, 1],
+        {1: ["1", "2"]},
+    )
+
+    assert plans[0].replicas[0].stage_cfg is typed_configs[0]
+    assert plans[0].replicas[0].legacy_stage_cfg is legacy_configs[0]
+    assert plans[0].replicas[0].metadata.runtime_cfg is typed_configs[0].runtime_config
+    assert all(isinstance(replica.stage_cfg, type(typed_configs[1])) for replica in plans[1].replicas)
+    assert [replica.stage_cfg.runtime_config.devices for replica in plans[1].replicas] == ["1", "2"]
+    assert [replica.legacy_stage_cfg.runtime.devices for replica in plans[1].replicas] == ["1", "2"]
+    assert plans[2].replicas[0].stage_cfg is typed_configs[2]
+    assert build_args.call_args_list[0].args[0] is legacy_configs[0]
+    assert build_args.call_args_list[1].args[0] is legacy_configs[1]

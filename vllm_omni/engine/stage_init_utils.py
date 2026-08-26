@@ -65,9 +65,15 @@ class ReplicaInitPlan:
     metadata: Any
     stage_connector_spec: dict[str, Any]
     omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
+    legacy_stage_cfg: Any | None = None
     stage_vllm_config: Any | None = None
     executor_class: type | None = None
     engine_args_dict: dict[str, Any] | None = None
+
+    @property
+    def runtime_stage_cfg(self) -> Any:
+        "Return the temporary legacy launch payload when one is required."
+        return self.legacy_stage_cfg if self.legacy_stage_cfg is not None else self.stage_cfg
 
 
 @dataclass
@@ -491,11 +497,10 @@ def _resolve_omni_metadata_hook(path: str | None) -> Callable | None:
 def extract_stage_metadata_from_omni_stage_config(
     stage_config: BaseVllmOmniStageConfig,
 ) -> StageMetadata:
-    """Project one typed stage config into metadata for a future cutover.
+    """Project one typed stage config into runtime-planning metadata.
 
-    This projection is not used by production startup yet. Current replica
-    layout, engine-argument, remote-diffusion, and platform setup paths still
-    require the legacy StageConfig/OmegaConf shape.
+    Engine construction and diffusion/remote launch remain separate migration
+    slices and still use the temporary legacy launch payload.
     """
     stage_type: Literal["llm", "diffusion"] = "diffusion" if stage_config.stage_type == StageType.DIFFUSION else "llm"
     sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
@@ -637,6 +642,10 @@ def get_stage_tp_size(stage_cfg: Any) -> int:
 def get_stage_devices_per_replica(stage_cfg: Any) -> int:
     """Return the number of devices consumed by one replica of *stage_cfg*."""
     engine_args = getattr(stage_cfg, "engine_args", {})
+    typed_parallel_config = getattr(stage_cfg, "parallel_config", None)
+    if typed_parallel_config is not None:
+        return max(1, int(getattr(typed_parallel_config, "world_size", 1)))
+
     if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
         parallel_config = _get_attr_or_item(engine_args, "parallel_config")
         if parallel_config is None:
@@ -678,7 +687,7 @@ def compute_replica_layout(
     """
     replicas_per_stage: list[int] = []
     for stage_cfg in stage_configs:
-        runtime_cfg = getattr(stage_cfg, "runtime", {})
+        runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", {}))
         num_replicas = int(
             runtime_cfg.get("num_replicas", 1)
             if hasattr(runtime_cfg, "get")
@@ -693,7 +702,7 @@ def compute_replica_layout(
         num_replicas = replicas_per_stage[stage_id]
         if num_replicas <= 1:
             continue
-        runtime_cfg = getattr(stage_cfg, "runtime", {})
+        runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", {}))
         devices_str = (
             runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
         )
