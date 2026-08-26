@@ -255,6 +255,7 @@ class AsyncOmniEngine:
             stage_configs=self.stage_configs,
             model=self.model,
             config_path=self.config_path,
+            typed_stage_configs=getattr(self, "_typed_stage_configs", None),
             single_stage_mode=self.single_stage_mode,
             stage_init_timeout=stage_init_timeout,
             diffusion_batch_size=self.diffusion_batch_size,
@@ -899,6 +900,9 @@ class AsyncOmniEngine:
         config_path = resolved.config_path
         stage_configs = list(resolved.stage_configs)
         strategy_lb_policy = resolved.omni_lb_policy
+        self._typed_stage_configs = (
+            list(resolved.omni_config.stage_configs) if resolved.omni_config is not None else None
+        )
         self.endpoint_restrictions = resolved.endpoint_restrictions
         pipeline_config = resolved.pipeline_config
         self._duplex_runtime_extension_path = (

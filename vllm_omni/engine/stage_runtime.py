@@ -18,6 +18,7 @@ import janus
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
 
+from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -52,6 +53,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_vllm_config,
     compute_replica_layout,
     extract_legacy_stage_metadata,
+    extract_stage_metadata_from_omni_stage_config,
     get_stage_connector_spec,
     inject_kv_stage_info,
     inject_omni_kv_connector_config,
@@ -123,6 +125,7 @@ class StageRuntime:
         model: str,
         config_path: str,
         *,
+        typed_stage_configs: list[BaseVllmOmniStageConfig] | None = None,
         stage_init_timeout: int,
         diffusion_batch_size: int,
         async_chunk: bool,
@@ -130,6 +133,8 @@ class StageRuntime:
         log_stats: bool = False,
     ) -> None:
         self._stage_configs = stage_configs
+        self._typed_stage_configs = typed_stage_configs
+        self._planning_stage_configs = typed_stage_configs if typed_stage_configs is not None else stage_configs
         self._model = model
         self._config_path = config_path
         self._stage_init_timeout = stage_init_timeout
@@ -137,7 +142,7 @@ class StageRuntime:
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
         self._log_stats = log_stats
-        self._num_stages = len(stage_configs)
+        self._num_stages = len(self._planning_stage_configs)
 
         # Populated by initialize()
         self.stage_pools: list[StagePool] = []
@@ -277,7 +282,7 @@ class StageRuntime:
 
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         """Build logical stage plans and cache prompt expansion metadata."""
-        replicas_per_stage, replica_devices_map = compute_replica_layout(self._stage_configs)
+        replicas_per_stage, replica_devices_map = compute_replica_layout(self._planning_stage_configs)
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self._model, self._config_path)
         stage_plans = self._build_logical_stage_init_plans(
@@ -342,12 +347,13 @@ class StageRuntime:
         """Build startup plans for every logical stage and replica."""
         stage_plans: list[LogicalStageInitPlan] = []
 
-        # RFC #4021 transition boundary: stage planning still relies on legacy
-        # StageConfig.runtime and StageConfig.engine_args for replica and engine
-        # setup. Keep metadata extraction on the legacy path until the
-        # coordinated stage-init cutover.
-        for stage_idx, stage_cfg in enumerate(self._stage_configs):
-            base_metadata = extract_legacy_stage_metadata(stage_cfg)
+        for stage_idx, stage_cfg in enumerate(self._planning_stage_configs):
+            legacy_stage_cfg = self._stage_configs[stage_idx]
+            base_metadata = (
+                extract_stage_metadata_from_omni_stage_config(stage_cfg)
+                if isinstance(stage_cfg, BaseVllmOmniStageConfig)
+                else extract_legacy_stage_metadata(stage_cfg)
+            )
             stage_id = int(base_metadata.stage_id)
             if stage_id != stage_idx:
                 raise ValueError(
@@ -371,11 +377,11 @@ class StageRuntime:
             executor_class = None
             engine_args_dict = None
             if base_metadata.stage_type != "diffusion":
-                # The stable adapter entry point still receives the same
-                # legacy stage object as replica planning. Its implementation
-                # switches only at the coordinated RFC #4021 cutover.
+                # Engine construction is the next RFC #4021 slice. Until then,
+                # the stable adapter receives the paired legacy launch payload;
+                # planning and metadata above remain fully typed.
                 engine_args_dict = build_engine_args_dict(
-                    stage_cfg,
+                    legacy_stage_cfg,
                     self._model,
                     stage_connector_spec=stage_connector_spec,
                     cli_tokenizer=self._tokenizer,
@@ -391,7 +397,7 @@ class StageRuntime:
                     self._stage_configs,
                 )
                 stage_vllm_config, executor_class = build_vllm_config(
-                    stage_cfg,
+                    legacy_stage_cfg,
                     self._model,
                     stage_connector_spec=stage_connector_spec,
                     engine_args_dict=engine_args_dict,
@@ -399,10 +405,19 @@ class StageRuntime:
 
             for replica_id in range(num_replicas):
                 replica_cfg = copy.deepcopy(stage_cfg) if replica_id > 0 else stage_cfg
+                legacy_replica_cfg = copy.deepcopy(legacy_stage_cfg) if replica_id > 0 else legacy_stage_cfg
                 if stage_idx in replica_devices_map:
-                    replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
+                    devices = replica_devices_map[stage_idx][replica_id]
+                    runtime_cfg = getattr(replica_cfg, "runtime_config", getattr(replica_cfg, "runtime", None))
+                    if runtime_cfg is not None:
+                        runtime_cfg.devices = devices
+                    legacy_replica_cfg.runtime.devices = devices
 
-                replica_metadata = extract_legacy_stage_metadata(replica_cfg)
+                replica_metadata = (
+                    extract_stage_metadata_from_omni_stage_config(replica_cfg)
+                    if isinstance(replica_cfg, BaseVllmOmniStageConfig)
+                    else extract_legacy_stage_metadata(replica_cfg)
+                )
                 replica_metadata.replica_id = replica_id
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
@@ -412,6 +427,7 @@ class StageRuntime:
                         num_replicas=num_replicas,
                         launch_mode=launch_mode,
                         stage_cfg=replica_cfg,
+                        legacy_stage_cfg=legacy_replica_cfg,
                         metadata=replica_metadata,
                         stage_connector_spec=stage_connector_spec,
                         omni_kv_connector=omni_kv_connector,
@@ -584,7 +600,7 @@ class StageRuntime:
                     log_stats=self._log_stats,
                     stage_id=plan.metadata.stage_id,
                     replica_id=plan.replica_id,
-                    stage_config=plan.stage_cfg,
+                    stage_config=plan.runtime_stage_cfg,
                     omni_master_server=self._get_omni_master_server(),
                     omni_coordinator_address=self._get_coordinator_address(),
                     stage_visible_devices=physical_devices,
@@ -652,11 +668,11 @@ class StageRuntime:
             ):
                 omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
                 if omni_conn_cfg:
-                    inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self._stage_configs)
+                    inject_omni_kv_config(plan.runtime_stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                inject_kv_stage_info(plan.runtime_stage_cfg, plan.metadata.stage_id, self._stage_configs)
                 client, resources = launch_diffusion_stage_replica(
                     model=self._model,
-                    stage_config=plan.stage_cfg,
+                    stage_config=plan.runtime_stage_cfg,
                     metadata=plan.metadata,
                     stage_init_timeout=stage_init_timeout,
                     batch_size=self._diffusion_batch_size,
@@ -753,6 +769,7 @@ class DistStageRuntime(StageRuntime):
         model: str,
         config_path: str,
         *,
+        typed_stage_configs: list[BaseVllmOmniStageConfig] | None = None,
         stage_init_timeout: int,
         diffusion_batch_size: int,
         async_chunk: bool,
@@ -770,6 +787,7 @@ class DistStageRuntime(StageRuntime):
             stage_configs=stage_configs,
             model=model,
             config_path=config_path,
+            typed_stage_configs=typed_stage_configs,
             stage_init_timeout=stage_init_timeout,
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
@@ -1093,6 +1111,7 @@ def create_stage_runtime(
     model: str,
     config_path: str,
     *,
+    typed_stage_configs: list[BaseVllmOmniStageConfig] | None = None,
     single_stage_mode: bool,
     stage_init_timeout: int,
     diffusion_batch_size: int,
@@ -1116,6 +1135,7 @@ def create_stage_runtime(
             stage_configs=stage_configs,
             model=model,
             config_path=config_path,
+            typed_stage_configs=typed_stage_configs,
             stage_init_timeout=stage_init_timeout,
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
@@ -1133,6 +1153,7 @@ def create_stage_runtime(
         stage_configs=stage_configs,
         model=model,
         config_path=config_path,
+        typed_stage_configs=typed_stage_configs,
         stage_init_timeout=stage_init_timeout,
         diffusion_batch_size=diffusion_batch_size,
         async_chunk=async_chunk,

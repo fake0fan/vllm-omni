@@ -24,14 +24,15 @@ class OmniConfigResolution:
     """Migration envelope returned by the production config resolver.
 
     ``stage_configs`` intentionally carries the current OmegaConf-compatible
-    runtime ABI only until stage startup consumes ``VllmOmniConfig`` directly.
-    It is not a stable authoring or extension API; new production callers
-    should resolve through :func:`resolve_omni_config` and must not construct or
+    launch ABI alongside the typed ``omni_config`` used by runtime planning.
+    The compatibility shape is not a stable authoring or extension API; new
+    production callers should resolve through :func:`resolve_omni_config` and not construct or
     merge this compatibility shape themselves.
     """
 
     config_path: str | None
     stage_configs: tuple[Any, ...]  # Temporary StageConfig/OmegaConf bridge.
+    omni_config: VllmOmniConfig | None = None
     pipeline_config: PipelineConfig | None = None
     omni_lb_policy: str | None = None
 
@@ -163,9 +164,9 @@ def _build_registered_resolution(
     strategy_config_path: str | None,
 ) -> OmniConfigResolution:
     """Build the temporary runtime view for an already-resolved pipeline."""
-    # Runtime consumers have not yet moved to typed per-stage configs. Use the
-    # factory-owned compatibility bridge instead of reimplementing legacy YAML
-    # discovery and merging in this resolver.
+    # Runtime planning consumes structured stages, while engine/diffusion launch
+    # still needs the factory-owned compatibility bridge. Keep that bridge here
+    # instead of reconstructing the legacy shape in a consumer.
     legacy_stages, omni_lb_policy = StageConfigFactory.create_legacy_stage_configs_from_model(
         model,
         trust_remote_code=trust_remote_code,
@@ -182,6 +183,7 @@ def _build_registered_resolution(
     return OmniConfigResolution(
         config_path=structured_config.orchestrator_config.deploy_config_path,
         stage_configs=tuple(stage.to_omegaconf() for stage in legacy_stages),
+        omni_config=structured_config,
         pipeline_config=structured_config.pipeline_config,
         omni_lb_policy=omni_lb_policy,
     )
