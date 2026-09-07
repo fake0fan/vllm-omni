@@ -28,6 +28,8 @@ class OmniConfigResolution:
 
     ``stage_configs`` intentionally carries the current OmegaConf-compatible
     runtime ABI only until stage startup consumes ``VllmOmniConfig`` directly.
+    ``pipeline_config`` is the effective topology after runtime stage injection,
+    so both fields always describe the same set of stages.
     It is not a stable authoring or extension API; new production callers
     should resolve through :func:`resolve_omni_config` and must not construct or
     merge this compatibility shape themselves.
@@ -183,7 +185,7 @@ def _build_registered_resolution(
     # factory-owned compatibility bridge instead of reimplementing legacy YAML
     # discovery and merging in this resolver.
     effective_deploy_path = structured_config.orchestrator_config.deploy_config_path
-    legacy_stages, omni_lb_policy = StageConfigFactory._create_legacy_from_registry(
+    legacy_resolution = StageConfigFactory._resolve_legacy_from_registry(
         structured_config.pipeline_config,
         cli_overrides,
         effective_deploy_path,
@@ -192,9 +194,9 @@ def _build_registered_resolution(
 
     return OmniConfigResolution(
         config_path=effective_deploy_path,
-        stage_configs=tuple(stage.to_omegaconf() for stage in legacy_stages),
-        pipeline_config=structured_config.pipeline_config,
-        omni_lb_policy=omni_lb_policy,
+        stage_configs=tuple(stage.to_omegaconf() for stage in legacy_resolution.stage_configs),
+        pipeline_config=legacy_resolution.pipeline_config,
+        omni_lb_policy=legacy_resolution.omni_lb_policy,
     )
 
 

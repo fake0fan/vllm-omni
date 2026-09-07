@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +46,15 @@ logger = init_logger(__name__)
 # defaults can't drift apart. This is the light slice; the full device-layout
 # centralization is tracked as a follow-up.
 _DEFAULT_PARALLEL_DEGREE = 1
+
+
+@dataclass(frozen=True)
+class _LegacyConfigResolution:
+    """Factory-owned result for the temporary legacy runtime bridge."""
+
+    stage_configs: list[StageConfig]
+    pipeline_config: PipelineConfig
+    omni_lb_policy: str | None
 
 
 @functools.cache
@@ -436,14 +445,29 @@ class StageConfigFactory:
         user_deploy_config: DeployConfig | None = None,
         strategy_specs: Mapping[Any, Any] | None = None,
     ) -> tuple[list[StageConfig], str | None]:
-        """Create current runtime StageConfigs from registry + deploy YAML.
+        """Return the existing two-value legacy runtime ABI."""
+        resolved = cls._resolve_legacy_from_registry(
+            pipeline_cfg,
+            cli_overrides,
+            deploy_config_path,
+            user_deploy_config,
+            strategy_specs,
+        )
+        return resolved.stage_configs, resolved.omni_lb_policy
+
+    @classmethod
+    def _resolve_legacy_from_registry(
+        cls,
+        pipeline_cfg: PipelineConfig,
+        cli_overrides: dict[str, Any],
+        deploy_config_path: str | None = None,
+        user_deploy_config: DeployConfig | None = None,
+        strategy_specs: Mapping[Any, Any] | None = None,
+    ) -> _LegacyConfigResolution:
+        """Create runtime stages and retain their effective topology.
 
         Precedence: caller-typed (non-None) value > deploy YAML >
         StageDeployConfig dataclass default.
-
-        Returns ``(stages, omni_lb_policy)`` — the strategy-derived pipeline-wide
-        load-balancer policy (``None`` when no strategy set one) travels with the
-        stages instead of through a mutable out-param.
         """
         cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
         deploy_cfg: DeployConfig | None
@@ -482,7 +506,11 @@ class StageConfigFactory:
         cls._reconcile_strategy_with_cli(stages, applied)
 
         omni_lb_policy = applied.omni_lb_policy if applied is not None else None
-        return stages, omni_lb_policy
+        return _LegacyConfigResolution(
+            stage_configs=stages,
+            pipeline_config=pipeline_cfg,
+            omni_lb_policy=omni_lb_policy,
+        )
 
     @staticmethod
     def _apply_strategy_specs(

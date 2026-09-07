@@ -55,7 +55,8 @@ def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
         parsed = parse_stage_overrides(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
-    assert parsed is not None
+    if parsed is None:
+        raise argparse.ArgumentTypeError("--stage-overrides requires a JSON object")
     return parsed
 
 

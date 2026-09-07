@@ -13,12 +13,14 @@ import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.resolver import (
     OmniConfigResolution,
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
     resolve_omni_config,
 )
+from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
@@ -387,8 +389,12 @@ class TestResolveOmniConfig:
             return_value=structured_config,
         )
         create_legacy = mocker.patch(
-            "vllm_omni.config.resolver.StageConfigFactory._create_legacy_from_registry",
-            return_value=([legacy_stage], "round_robin"),
+            "vllm_omni.config.resolver.StageConfigFactory._resolve_legacy_from_registry",
+            return_value=SimpleNamespace(
+                stage_configs=[legacy_stage],
+                pipeline_config=structured_config.pipeline_config,
+                omni_lb_policy="round_robin",
+            ),
         )
         strategy_specs = {"stage_1": {"dp": 3}}
         load_strategy = mocker.patch(
@@ -428,6 +434,34 @@ class TestResolveOmniConfig:
         assert resolved.omni_lb_policy == "round_robin"
         assert resolved.endpoint_restrictions == (endpoint_restriction,)
         assert resolved.stage_configs == (runtime_stage,)
+
+    def test_registered_resolution_exposes_forced_aligner_topology(self, mocker: MockerFixture):
+        pipeline = OMNI_PIPELINES["qwen3_tts"]
+        assert isinstance(pipeline, PipelineConfig)
+        structured_config = SimpleNamespace(
+            orchestrator_config=SimpleNamespace(deploy_config_path=None),
+            pipeline_config=pipeline,
+        )
+        mocker.patch(
+            "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
+            return_value=structured_config,
+        )
+
+        resolved = resolve_omni_config(
+            "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            trust_remote_code=False,
+            deploy_config_path=None,
+            cli_overrides={"forced_aligner": "/models/Qwen3-ForcedAligner-0.6B"},
+            stage_overrides=None,
+            strategy_config_path=None,
+        )
+
+        assert resolved.pipeline_config is not None
+        pipeline_stage_ids = [stage.stage_id for stage in resolved.pipeline_config.stages]
+        runtime_stage_ids = [stage.stage_id for stage in resolved.stage_configs]
+        assert pipeline_stage_ids == runtime_stage_ids
+        assert resolved.pipeline_config.stages[-1].model_stage == "forced_aligner"
+        assert len(resolved.pipeline_config.stages) == len(pipeline.stages) + 1
 
 
 class TestCumulativeStreamingCoercion:

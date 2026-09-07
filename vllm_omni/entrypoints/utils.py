@@ -51,7 +51,7 @@ def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: 
 
 def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     """Parse and validate the shape of per-stage JSON overrides."""
-    if not value:
+    if value is None:
         return None
     if isinstance(value, str):
         try:
@@ -66,9 +66,6 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
             "--stage-overrides must be a JSON object mapping stage_id -> overrides, "
             f"got {type(parsed).__name__}: {parsed!r}"
         )
-    if not parsed:
-        return None
-
     for stage_id, overrides in parsed.items():
         if not isinstance(stage_id, str) or not stage_id.isascii() or not stage_id.isdigit():
             raise ValueError(

@@ -196,6 +196,16 @@ def test_serve_parser_parses_stage_overrides_before_resolution() -> None:
     assert args.stage_overrides == {"0": {"devices": "0,1"}}
 
 
+def test_serve_parser_accepts_empty_stage_overrides_as_noop() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--stage-overrides", "{}"])
+
+    assert args.stage_overrides == {}
+
+
 def test_parse_stage_overrides_invalid_json_raises() -> None:
     """Invalid JSON fails at the serving boundary with the raw input."""
     bad = "{not valid json}"
